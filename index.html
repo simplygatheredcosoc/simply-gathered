@@ -230,7 +230,7 @@ function toast(m){const t=document.getElementById('toast');t.textContent=m;t.cla
 function addLog(m){const l=document.getElementById('aLC'),b=document.getElementById('aLog');b.style.display='block';l.innerHTML+='<div>'+new Date().toLocaleTimeString().slice(0,5)+' → '+m+'</div>';b.scrollTop=b.scrollHeight;}
 
 // ═══ AI PIPELINE ═══
-async function claudeVision(b64){addLog('Sending to Claude Vision...');const mt=b64.startsWith('data:image/png')?'image/png':'image/jpeg',raw=b64.split(',')[1];const r=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:raw,mediaType:mt})});if(!r.ok){const e=await r.json().catch(()=>({}));throw new Error('Analyze: '+(e.error||r.status));}const d=await r.json();addLog('Claude responded!');return d;}
+async function claudeVision(b64){addLog('Sending to Claude Vision...');const mt=b64.startsWith('data:image/png')?'image/png':'image/jpeg',raw=b64.split(',')[1];addLog('Image size: '+(raw.length/1024).toFixed(0)+'KB');try{const r=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:raw,mediaType:mt})});const d=await r.json();if(!r.ok){addLog('Error: '+JSON.stringify(d).substring(0,200));throw new Error(d.error||'Status '+r.status);}addLog('Claude identified '+d.items.length+' items');return d;}catch(e){addLog('Fetch error: '+e.message);throw e;}}
 
 async function serpSearch(q){addLog('Searching: '+q.substring(0,40)+'...');const r=await fetch('/api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})});if(!r.ok){const e=await r.json().catch(()=>({}));throw new Error('Search: '+(e.error||r.status));}const d=await r.json();return d.results||[];}
 
