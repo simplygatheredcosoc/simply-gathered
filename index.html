@@ -388,7 +388,7 @@ function affLink(url){if(CFG.shK&&url)return'https://api.shopstyle.com/action/ap
 function isSG(url){return CFG.sgU&&url&&url.toLowerCase().includes(CFG.sgU.toLowerCase().replace(/https?:\/\//,'').split('/')[0]);}
 
 async function realAnalysis(){
-  var steps=['Analyzing with AI...','Matching to luxury retailers...','Building direct links...','Organizing results...'];
+  var steps=['Analyzing image with AI...','Searching the web for exact products...','Building direct links...','Organizing results...'];
   var el=document.getElementById('aSteps');el.innerHTML='';
   steps.forEach(function(s,i){el.innerHTML+='<div id="as'+i+'" style="display:flex;align-items:center;gap:8px;padding:6px 0;opacity:.25;transition:opacity .3s"><div id="ad'+i+'" style="width:18px;height:18px;border-radius:50%;flex-shrink:0;background:var(--border);display:flex;align-items:center;justify-content:center;font-size:9px;transition:all .3s"></div><span style="font-size:12px">'+s+'</span></div>';});
   function ms(i,st){if(i<0||i>=steps.length)return;var d=document.getElementById('ad'+i),s=document.getElementById('as'+i);s.style.opacity='1';if(st==='on'){d.style.background='var(--navy)';d.innerHTML='<div class="spin" style="width:8px;height:8px;border:2px solid rgba(255,255,255,.3);border-top-color:white;border-radius:50%"></div>';}else if(st==='ok'){d.style.background='var(--green)';d.innerHTML='✓';d.style.color='white';}else{d.style.background='var(--blush)';d.innerHTML='✕';d.style.color='white';}}
@@ -412,11 +412,13 @@ async function realAnalysis(){
       var item=analysis.items[i];
       addLog('Linking: '+item.name);
       var products=(item.retailers||[]).map(function(ret){
+        // Use direct URL from web search if available, otherwise build retailer link
+        var link=ret.url&&ret.url.startsWith('http')?ret.url:buildRetailerLink(ret.store,ret.search_term||item.name);
         return {
           title:ret.product_name||item.name,
           price:ret.price_estimate||0,
           source:ret.store,
-          link:buildRetailerLink(ret.store,ret.search_term||item.name),
+          link:link,
           thumbnail:'',
           isSG:false
         };
