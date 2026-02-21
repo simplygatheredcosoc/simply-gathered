@@ -1,0 +1,11 @@
+{
+  "functions": {
+    "api/analyze.js": {
+      "maxDuration": 60,
+      "memory": 1024
+    },
+    "api/search.js": {
+      "maxDuration": 30
+    }
+  }
+}
