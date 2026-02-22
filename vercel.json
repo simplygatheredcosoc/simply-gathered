@@ -1,0 +1,25 @@
+{
+  "item_matches": [
+    {
+      "item_id": "item_01",
+      "item_name": "scalloped ceramic dinner plate",
+      "match_type": "exact",
+      "confidence": 93,
+      "exact_match": {
+        "lens_index": 4,
+        "title": "Scalloped Stoneware Dinner Plate",
+        "source": "Anthropologie",
+        "link": "https://...",
+        "thumbnail": "https://..."
+      },
+      "evidence": [
+        "Object type matches dinner plate",
+        "Scalloped rim shape matches",
+        "Color and glaze finish appear consistent"
+      ],
+      "rejected_candidates": [
+        { "lens_index": 2, "reason": "Glassware, wrong object type" }
+      ]
+    }
+  ]
+}
