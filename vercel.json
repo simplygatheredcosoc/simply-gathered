@@ -1,0 +1,1 @@
+{"functions":{"api/analyze.js":{"maxDuration":120},"api/budget.js":{"maxDuration":90},"api/preview.js":{"maxDuration":90},"api/tablescape.js":{"maxDuration":120},"api/homedesign.js":{"maxDuration":120}}}
