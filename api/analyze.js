@@ -6,25 +6,25 @@ export const config = {
 };
 
 /**
- * BEGINNER-FRIENDLY ANALYZE V2
+ * ANALYZE V3 (single-file, beginner-friendly)
  *
- * What it does:
- * 1) Detects all visible shoppable items in the image (AI vision)
- * 2) Uploads image (optional) to get a public URL for Google Lens
- * 3) Pulls visual matches + shopping candidates (SerpAPI)
- * 4) Verifies exact matches item-by-item (AI verification pass)
- * 5) Generates better "near exact" recommendations (AI recommendations pass)
- * 6) Returns a structured JSON response your frontend can render
+ * Improvements vs prior version:
+ * - Better exact-match verification structure
+ * - Better fallback behavior when OpenAI/SerpAPI returns partial data
+ * - "Style anchor" recommendations:
+ *   If an exact/near-exact match exists, recommendations are derived from the exact match title/source first
+ *   so results stay much closer to the original item (instead of generic green alternatives)
+ * - Includes LTK / LikeToKnowIt / ShopMy in recommendation targets
  *
- * REQUIRED ENV VARS (in Vercel Project Settings → Environment Variables):
+ * REQUIRED ENV VARS (Vercel Project Settings → Environment Variables):
  * - OPENAI_API_KEY   (required)
- * - SERPAPI_KEY      (recommended for Google Lens + Shopping)
+ * - SERPAPI_KEY      (recommended)
  *
- * OPTIONAL ENV VARS (for image hosting so Google Lens can see the uploaded image):
+ * OPTIONAL ENV VARS (image hosting so Google Lens can analyze uploaded image):
  * - FREEIMAGE_KEY
  * - IMGBB_KEY
  *
- * Optional:
+ * OPTIONAL:
  * - OPENAI_MODEL (default: gpt-4.1-mini)
  */
 
@@ -35,12 +35,18 @@ const ALLOWED_RETAILERS = [
   'Target', 'Nordstrom', "Bloomingdale's", 'Juliska', 'Vietri', 'MacKenzie-Childs',
   'Sur La Table', 'Food52', 'Wayfair', 'Amazon', 'World Market', 'Replacements Ltd',
   'East Fork', 'Heath Ceramics', 'Minted', 'Ruggable', 'Loloi',
-  // creator-commerce marketplaces user asked for
   'LTK', 'LikeToKnowIt', 'ShopMy'
 ];
 
+const PREMIUM_TABLETOP_BRANDS = [
+  'Carolina Irving & Daughters', 'Carolina Irving and Daughters', 'Juliska', 'Vietri',
+  'Ginori', 'Ginori 1735', 'Herend', 'Bernardaud', 'Wedgwood', 'Waterford',
+  'MacKenzie-Childs', 'Lenox', 'Spode', 'Williams Sonoma', 'Anthropologie',
+  'Sur La Table', 'Replacements Ltd', 'Chairish', 'Etsy'
+];
+
 function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+  return new Promise(r => setTimeout(r, ms));
 }
 
 function safeNum(n, fallback = 0) {
@@ -52,30 +58,34 @@ function normalizeString(s) {
   return String(s || '').trim();
 }
 
+function uniqueStrings(arr) {
+  return [...new Set((arr || []).map(x => String(x || '').trim()).filter(Boolean))];
+}
+
+function safeArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
 function tryParseJson(text) {
   if (!text || typeof text !== 'string') return null;
 
   let t = text.trim();
 
   // Remove markdown fences
-  t = t.replace(/^```json\s*/i, '').replace(/^```/, '').replace(/```$/, '').trim();
+  t = t.replace(/^```json\s*/i, '').replace(/^```/, '').replace(/```$/,'').trim();
 
-  // Direct parse first
-  try {
-    return JSON.parse(t);
-  } catch (_) {}
+  // Direct parse
+  try { return JSON.parse(t); } catch (_) {}
 
-  // Try extracting the largest JSON object block
+  // Extract largest JSON object block
   const firstBrace = t.indexOf('{');
   const lastBrace = t.lastIndexOf('}');
   if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
     const sliced = t.slice(firstBrace, lastBrace + 1);
-    try {
-      return JSON.parse(sliced);
-    } catch (_) {}
+    try { return JSON.parse(sliced); } catch (_) {}
   }
 
-  // Truncation repair attempt (close braces/brackets)
+  // Truncation repair
   try {
     let fixed = t.replace(/,\s*$/, '');
     const opensB = (fixed.match(/{/g) || []).length;
@@ -118,15 +128,17 @@ function makeSearchUrl(retailer, query) {
   if (r.includes('wayfair')) return `https://www.wayfair.com/keyword.php?keyword=${q}`;
   if (r.includes('serena')) return `https://www.serenaandlily.com/search?q=${q}`;
   if (r.includes('juliska')) return `https://www.juliska.com/search?type=product&q=${q}`;
+  if (r.includes('vietri')) return `https://vietri.com/search?q=${q}`;
   if (r.includes('sur la table')) return `https://www.surlatable.com/search/?q=${q}`;
   if (r.includes('food52')) return `https://food52.com/shop?query=${q}`;
+  if (r.includes('replacements')) return `https://www.replacements.com/search?query=${q}`;
+  if (r.includes('chairish')) return `https://www.chairish.com/search?q=${q}`;
   if (r.includes('ltk') || r.includes('liketoknowit')) return `https://www.shopltk.com/search?query=${q}`;
   if (r.includes('shopmy')) return `https://shopmy.us/search?q=${q}`;
   return `https://www.google.com/search?q=${q}`;
 }
 
 function scoreCandidateHeuristic(item, candidate) {
-  // Light heuristic used only for fallback ordering, not exact verification.
   const itemName = (item?.name || '').toLowerCase();
   const candTitle = (candidate?.title || '').toLowerCase();
   const itemType = (item?.object_type || '').toLowerCase();
@@ -135,31 +147,107 @@ function scoreCandidateHeuristic(item, candidate) {
 
   if (itemType && candTitle.includes(itemType)) score += 25;
 
-  // keyword overlap
-  const words = itemName.split(/[^a-z0-9]+/i).filter((w) => w.length > 2);
+  const words = itemName.split(/[^a-z0-9]+/i).filter(w => w.length > 2);
   const unique = [...new Set(words)];
   for (const w of unique) {
     if (candTitle.includes(w)) score += 5;
   }
 
-  // shape/material/style hints
   const hints = [
-    ...(item?.shape_keywords || []),
-    ...(item?.material_keywords || []),
-    ...(item?.color_keywords || [])
-  ].map((x) => String(x || '').toLowerCase());
+    ...safeArray(item?.shape_keywords),
+    ...safeArray(item?.material_keywords),
+    ...safeArray(item?.color_keywords),
+    ...safeArray(item?.pattern_keywords)
+  ].map(x => String(x || '').toLowerCase());
 
   for (const h of hints) {
     if (h && candTitle.includes(h)) score += 4;
   }
 
+  // Small boost if source looks more premium for detailed tabletop objects
+  const source = (candidate?.source || '').toLowerCase();
+  if (['juliska', 'vietri', 'anthropologie', 'williams sonoma', 'sur la table', 'replacements', 'chairish'].some(b => source.includes(b))) {
+    score += 4;
+  }
+
   return score;
+}
+
+function inferRetailerFromUrl(url = '') {
+  const u = String(url).toLowerCase();
+  if (u.includes('anthropologie')) return 'Anthropologie';
+  if (u.includes('potterybarn')) return 'Pottery Barn';
+  if (u.includes('williams-sonoma')) return 'Williams Sonoma';
+  if (u.includes('westelm')) return 'West Elm';
+  if (u.includes('crateandbarrel')) return 'Crate & Barrel';
+  if (u.includes('cb2')) return 'CB2';
+  if (u.includes('serenaandlily')) return 'Serena & Lily';
+  if (u.includes('juliska')) return 'Juliska';
+  if (u.includes('vietri')) return 'Vietri';
+  if (u.includes('surlatable')) return 'Sur La Table';
+  if (u.includes('food52')) return 'Food52';
+  if (u.includes('etsy')) return 'Etsy';
+  if (u.includes('chairish')) return 'Chairish';
+  if (u.includes('amazon')) return 'Amazon';
+  if (u.includes('wayfair')) return 'Wayfair';
+  if (u.includes('target')) return 'Target';
+  if (u.includes('shopltk')) return 'LTK';
+  if (u.includes('shopmy')) return 'ShopMy';
+  if (u.includes('replacements')) return 'Replacements Ltd';
+  return '';
+}
+
+function extractStyleAnchor(item, match) {
+  const exact = match?.exact_match || null;
+  const title = normalizeString(exact?.title);
+  const source = normalizeString(exact?.source || inferRetailerFromUrl(exact?.link || ''));
+  const raw = `${title} ${source}`.toLowerCase();
+
+  // very simple keyword extraction from exact match + item
+  const tokens = uniqueStrings([
+    ...safeArray(item?.shape_keywords),
+    ...safeArray(item?.material_keywords),
+    ...safeArray(item?.color_keywords),
+    ...safeArray(item?.pattern_keywords),
+  ].map(String));
+
+  // Add title-based hints
+  const titleHints = [];
+  const possibleHints = [
+    'scalloped', 'fluted', 'ribbed', 'coupe', 'round', 'oval',
+    'stoneware', 'ceramic', 'porcelain', 'glass', 'linen', 'cotton',
+    'green', 'emerald', 'sage', 'olive', 'ivory', 'white', 'gold',
+    'striped', 'stripe', 'floral', 'botanical', 'clover', 'check', 'gingham'
+  ];
+  for (const h of possibleHints) {
+    if (raw.includes(h)) titleHints.push(h);
+  }
+
+  const mergedKeywords = uniqueStrings([...tokens, ...titleHints]);
+
+  // crude brand detection from title/source (helps Carolina Irving cases)
+  let brand = source || '';
+  const premiumHit = PREMIUM_TABLETOP_BRANDS.find(b => raw.includes(b.toLowerCase()));
+  if (premiumHit) brand = premiumHit;
+
+  // collection-ish hint = first few words of title if we have exact title
+  let collection_hint = '';
+  if (title) {
+    collection_hint = title.split(' ').slice(0, 5).join(' ');
+  }
+
+  return {
+    brand,
+    source,
+    title,
+    collection_hint,
+    keywords: mergedKeywords
+  };
 }
 
 async function uploadImageForLens({ cleanImageB64, log, FREEIMAGE_KEY, IMGBB_KEY }) {
   let imageUrl = null;
 
-  // Try freeimage.host first
   if (FREEIMAGE_KEY) {
     try {
       const form = new URLSearchParams();
@@ -183,14 +271,13 @@ async function uploadImageForLens({ cleanImageB64, log, FREEIMAGE_KEY, IMGBB_KEY
       } else {
         log.push(`freeimage-fail:${r.status}`);
       }
-    } catch (e) {
+    } catch (_) {
       log.push('freeimage-err');
     }
   } else {
     log.push('freeimage:no-key');
   }
 
-  // Backup: imgbb
   if (!imageUrl && IMGBB_KEY) {
     try {
       const form = new URLSearchParams();
@@ -213,7 +300,7 @@ async function uploadImageForLens({ cleanImageB64, log, FREEIMAGE_KEY, IMGBB_KEY
       } else {
         log.push(`imgbb-fail:${r.status}`);
       }
-    } catch (e) {
+    } catch (_) {
       log.push('imgbb-err');
     }
   } else if (!imageUrl) {
@@ -279,7 +366,7 @@ async function serpGoogleLens({ SERP_KEY, imageUrl, log }) {
     const d = await r.json();
     const out = [];
 
-    for (const vm of (d.visual_matches || []).slice(0, 40)) {
+    for (const vm of safeArray(d.visual_matches).slice(0, 50)) {
       if (!vm?.link) continue;
       out.push({
         id: `lens_vm_${out.length}`,
@@ -293,7 +380,7 @@ async function serpGoogleLens({ SERP_KEY, imageUrl, log }) {
       });
     }
 
-    for (const sr of (d.shopping_results || []).slice(0, 20)) {
+    for (const sr of safeArray(d.shopping_results).slice(0, 25)) {
       const link = sr.product_link || sr.link;
       if (!link) continue;
       out.push({
@@ -310,20 +397,20 @@ async function serpGoogleLens({ SERP_KEY, imageUrl, log }) {
 
     log.push(`lens:${out.length}`);
     return out;
-  } catch (e) {
+  } catch (_) {
     log.push('lens-err');
     return [];
   }
 }
 
-async function serpShoppingSearch({ SERP_KEY, query, log }) {
+async function serpShoppingSearch({ SERP_KEY, query, log, num = 8 }) {
   if (!SERP_KEY || !query) return [];
   try {
     const params = new URLSearchParams({
       engine: 'google_shopping',
       q: query,
       api_key: SERP_KEY,
-      num: '8',
+      num: String(num),
       gl: 'us',
       hl: 'en'
     });
@@ -334,7 +421,7 @@ async function serpShoppingSearch({ SERP_KEY, query, log }) {
     }
     const d = await r.json();
 
-    const results = (d.shopping_results || [])
+    const results = safeArray(d.shopping_results)
       .map((x, i) => ({
         id: `shop_${i}_${Math.random().toString(36).slice(2, 6)}`,
         source_type: 'shopping_search',
@@ -345,11 +432,11 @@ async function serpShoppingSearch({ SERP_KEY, query, log }) {
         price: safeNum(x.extracted_price),
         raw: x
       }))
-      .filter((x) => x.link);
+      .filter(x => x.link);
 
     log.push(`shop:${results.length}`);
     return results;
-  } catch (e) {
+  } catch (_) {
     log.push('shop-err');
     return [];
   }
@@ -359,7 +446,8 @@ function dedupeCandidates(candidates) {
   const seen = new Set();
   const out = [];
   for (const c of candidates || []) {
-    const key = (c?.link || c?.title || '').toLowerCase().trim();
+    if (!c) continue;
+    const key = (c.link || c.title || '').toLowerCase().trim();
     if (!key || seen.has(key)) continue;
     seen.add(key);
     out.push(c);
@@ -369,22 +457,29 @@ function dedupeCandidates(candidates) {
 
 function buildCandidatePoolForItem(item, lensCandidates, textSearchCandidates) {
   const combined = dedupeCandidates([...(lensCandidates || []), ...(textSearchCandidates || [])]);
-
-  // Heuristic sort as a backup for no exact-match case
   combined.sort((a, b) => scoreCandidateHeuristic(item, b) - scoreCandidateHeuristic(item, a));
-  return combined.slice(0, 20);
+  return combined.slice(0, 24);
 }
 
 async function detectItemsPass({ OPENAI_KEY, model, imageDataUri, log }) {
   const system = `You are a visual product detection assistant for interior design and tablescape shopping.
-Your job is to identify all shoppable visible objects (not walls/floor unless a wallpaper/rug is a clear style feature).
+Your job is to identify all SHoppable visible objects (not walls/floor unless wallpaper/rug is a clear style feature).
 Be exhaustive but avoid duplicates.
-Separate overlapping items (e.g., charger plate + dinner plate + salad plate + napkin + napkin ring + glassware).`;
+Separate overlapping items (e.g., charger plate + dinner plate + salad plate + napkin + napkin ring + glassware).
+For tablescapes, pay special attention to:
+- charger, dinner plate, salad plate, bowl
+- placemat or charger mat
+- napkin and napkin ring
+- water goblet / wine glass / coupe / flute
+- flatware
+- candles / candleholders
+- centerpiece vessels`;
 
-  const userContent = [
+  const user = [
     {
       type: 'text',
-      text: `Analyze this photo and detect visible shoppable items.
+      text:
+`Analyze this photo and detect visible shoppable items.
 
 Return ONLY JSON with this shape:
 {
@@ -393,7 +488,7 @@ Return ONLY JSON with this shape:
     {
       "item_id": "item_01",
       "name": "specific name",
-      "object_type": "plate|glass|napkin|vase|chair|lamp|wallpaper|rug|etc",
+      "object_type": "plate|charger|placemat|glass|napkin|vase|chair|lamp|wallpaper|rug|flatware|candleholder|etc",
       "prominence": "hero|secondary|small",
       "quantity_estimate": 1,
       "color_keywords": ["white","green"],
@@ -408,10 +503,10 @@ Return ONLY JSON with this shape:
 
 Rules:
 - Include ALL visible tableware layers separately when possible.
-- Include all visible glasses separately by type (water goblet vs wine glass).
-- If there are multiple similar items, still list the object type at least once with quantity_estimate.
+- Include all visible glasses separately by type (water goblet vs wine glass) if identifiable, otherwise one glass item with quantity.
+- If there are multiple similar items, list it at least once and set quantity_estimate.
 - Do not invent brand names.
-- Do not include people, hands, food (unless the food vessel/platter itself is notable).`
+- Do not include people, hands, food (unless the serving vessel/platter itself is notable).`
     },
     {
       type: 'image_url',
@@ -424,9 +519,9 @@ Rules:
     model,
     messages: [
       { role: 'system', content: system },
-      { role: 'user', content: userContent }
+      { role: 'user', content: user }
     ],
-    maxTokens: 2200,
+    maxTokens: 2600,
     log,
     tag: 'detect'
   });
@@ -443,12 +538,13 @@ async function verifyExactMatchesPass({
   log
 }) {
   const system = `You are a strict product matcher.
-Your job is to choose ONLY true exact or near-exact matches from candidates.
-You must reject candidates that are the wrong object type (e.g. glass vs plate).
-You must avoid reusing the same candidate for multiple items.
-If uncertain, return no exact match.`;
+Choose ONLY true exact or near-exact matches from candidates.
+Reject wrong object types (e.g., glass vs plate).
+Do not reuse the same candidate for multiple items.
+If uncertain, return no exact match.
+Be conservative.`;
 
-  const userText = `You are matching detected image items to search candidates.
+  const userText = `Match detected image items to search candidates.
 
 Return ONLY JSON:
 {
@@ -476,15 +572,16 @@ Return ONLY JSON:
 
 Rules:
 1) Candidate locking: a candidate_id can be used as exact_match for ONLY ONE item total.
-2) First verify object type match (plate, glass, napkin, etc). If wrong type, reject.
+2) First verify object type match (plate, glass, napkin, placemat, flatware, etc).
 3) "exact" = same object and style details align strongly.
 4) "near_exact" = very close replacement if exact is unavailable.
 5) If no valid match, use match_type "none" and exact_match null.
-6) Be conservative and explain evidence.
-7) Prefer candidates whose title explicitly mentions key cues (shape/pattern/material).`;
+6) Prefer candidates with title cues matching shape/material/pattern.
+7) For tableware layers, do NOT assign the same plate result to multiple item types.
+`;
 
   const payload = {
-    detected_items: (detectedItems || []).map((i) => ({
+    detected_items: detectedItems.map(i => ({
       item_id: i.item_id,
       name: i.name,
       object_type: i.object_type,
@@ -495,7 +592,7 @@ Rules:
       placement: i.placement || '',
       notes: i.notes || ''
     })),
-    candidates_by_item: perItemCandidates || []
+    candidates_by_item: perItemCandidates
   };
 
   const parsed = await openAIChatJSON({
@@ -505,7 +602,7 @@ Rules:
       { role: 'system', content: system },
       { role: 'user', content: `${userText}\n\nDATA:\n${JSON.stringify(payload)}` }
     ],
-    maxTokens: 3200,
+    maxTokens: 3800,
     log,
     tag: 'verify'
   });
@@ -523,15 +620,11 @@ function enforceCandidateLocking(itemMatches) {
     const cid = clone?.exact_match?.candidate_id;
 
     if (cid && used.has(cid)) {
-      // If already used, downgrade to none
       clone.match_type = 'none';
       clone.confidence = Math.min(safeNum(clone.confidence, 0), 40);
-      clone.evidence = [
-        ...(clone.evidence || []),
-        'Candidate lock conflict: candidate was already assigned to another item'
-      ];
+      clone.evidence = [...safeArray(clone.evidence), 'Candidate lock conflict: candidate already assigned to another item'];
       clone.rejected_candidates = [
-        ...(clone.rejected_candidates || []),
+        ...safeArray(clone.rejected_candidates),
         { candidate_id: cid, reason: 'Candidate already used by another item' }
       ];
       clone.exact_match = null;
@@ -552,11 +645,18 @@ async function recommendationsPass({
   detectedItems,
   itemMatches,
   perItemCandidates,
+  styleAnchorsByItem,
   log
 }) {
-  const system = `You are a luxury shopping stylist.
-Generate recommendations that are CLOSE to the matched item (shape, material, color, vibe).
-When exact match exists, recommendations should feel like sister products, not random alternatives.`;
+  const system = `You are a luxury shopping stylist and product sourcer.
+Your job is to recommend products that stay VERY CLOSE to the original image item.
+
+Critical behavior:
+- If an exact_match or near_exact match exists, use it as a STYLE ANCHOR.
+- Derive recommendations from the exact match title/source/brand/keywords first.
+- Preserve object type, proportions, shape, material, motif/pattern, and finish.
+- Do NOT drift to generic items based only on color.
+- Prefer premium lookalikes when the exact match is from a premium designer brand.`;
 
   const userText = `Create recommendation sets for each detected item.
 
@@ -569,9 +669,9 @@ Return ONLY JSON:
         {
           "title": "product name",
           "source": "Retailer",
-          "search_url": "https://...",
+          "search_url": "https://... (site search URL is okay)",
           "estimated_price": 0,
-          "why": "why this is close in shape/color/material"
+          "why": "specific reason tied to shape/material/pattern and exact style anchor"
         }
       ]
     }
@@ -582,13 +682,14 @@ Rules:
 - 2 to 4 recommendations per item if possible.
 - Prioritize: ${ALLOWED_RETAILERS.join(', ')}.
 - Include LTK / LikeToKnowIt and ShopMy when relevant.
-- Stay very close to the item style, especially if an exact/near-exact match exists.
-- If item is highly specific, prefer fewer but better recommendations.
-- Use real retailer names and valid search URLs (site search URLs are okay).`;
+- If style_anchor.brand is a premium designer brand (e.g., Carolina Irving & Daughters), recommendations must feel like true lookalikes (not generic substitutes).
+- Prefer tabletop-specific brands for plates/glassware/linens: Juliska, Vietri, Williams Sonoma, Sur La Table, Anthropologie, Replacements Ltd, Chairish, Etsy artisans.
+- Use valid search URLs.
+`;
 
   const compact = {
     scene_summary: sceneSummary || '',
-    detected_items: (detectedItems || []).map((i) => ({
+    detected_items: detectedItems.map(i => ({
       item_id: i.item_id,
       name: i.name,
       object_type: i.object_type,
@@ -597,16 +698,17 @@ Rules:
       shape_keywords: i.shape_keywords || [],
       pattern_keywords: i.pattern_keywords || []
     })),
-    item_matches: (itemMatches || []).map((m) => ({
+    item_matches: itemMatches.map(m => ({
       item_id: m.item_id,
       item_name: m.item_name,
       match_type: m.match_type,
       confidence: m.confidence,
-      exact_match: m.exact_match || null
+      exact_match: m.exact_match
     })),
-    candidate_titles_by_item: (perItemCandidates || []).map((x) => ({
+    style_anchors_by_item: styleAnchorsByItem,
+    candidate_titles_by_item: perItemCandidates.map(x => ({
       item_id: x.item_id,
-      candidates: (x.candidates || []).slice(0, 8).map((c) => ({
+      candidates: safeArray(x.candidates).slice(0, 10).map(c => ({
         title: c.title,
         source: c.source,
         price: c.price
@@ -621,13 +723,54 @@ Rules:
       { role: 'system', content: system },
       { role: 'user', content: `${userText}\n\nDATA:\n${JSON.stringify(compact)}` }
     ],
-    maxTokens: 2600,
+    maxTokens: 3400,
     log,
     tag: 'recs'
   });
 
   if (!Array.isArray(parsed.recommendations_by_item)) parsed.recommendations_by_item = [];
   return parsed;
+}
+
+function buildRecommendationFallback(item, match, styleAnchor) {
+  const objectType = item?.object_type || 'item';
+  const itemName = item?.name || objectType;
+  const keywords = uniqueStrings([
+    ...(styleAnchor?.keywords || []),
+    ...safeArray(item?.shape_keywords),
+    ...safeArray(item?.pattern_keywords),
+    ...safeArray(item?.material_keywords),
+    ...safeArray(item?.color_keywords)
+  ]).slice(0, 6);
+
+  const base = (styleAnchor?.title || itemName).trim();
+  const brand = (styleAnchor?.brand || '').trim();
+
+  const premiumTablewareStores = ['Juliska', 'Vietri', 'Williams Sonoma', 'Anthropologie', 'Sur La Table', 'Replacements Ltd', 'Chairish', 'Etsy'];
+  const generalStores = ['Anthropologie', 'West Elm', 'Pottery Barn', 'Target', 'Wayfair', 'LTK', 'ShopMy'];
+
+  const chosenStores = ['plate', 'charger', 'placemat', 'glass', 'napkin', 'flatware', 'bowl'].includes(String(objectType).toLowerCase())
+    ? premiumTablewareStores
+    : generalStores;
+
+  const queryPieces = uniqueStrings([
+    brand,
+    ...keywords,
+    objectType,
+    itemName
+  ]).slice(0, 8);
+
+  const query = queryPieces.join(' ').trim() || itemName;
+
+  return chosenStores.slice(0, 3).map((store) => ({
+    title: `${base} style ${objectType}`.trim(),
+    source: store,
+    search_url: makeSearchUrl(store, query),
+    estimated_price: 0,
+    why: brand
+      ? `Uses the exact-match style anchor (${brand}) plus close shape/material/pattern keywords`
+      : `Uses the detected item’s shape/material/pattern keywords to stay close in style`
+  }));
 }
 
 export default async function handler(req, res) {
@@ -661,9 +804,7 @@ export default async function handler(req, res) {
   const imageDataUri = `data:${mediaType};base64,${cleanImage}`;
 
   try {
-    // ─────────────────────────────────────────────
-    // PASS 1: DETECTION (AI Vision)
-    // ─────────────────────────────────────────────
+    // PASS 1: Detection (AI vision)
     const detection = await detectItemsPass({
       OPENAI_KEY,
       model: OPENAI_MODEL,
@@ -672,24 +813,31 @@ export default async function handler(req, res) {
     });
 
     const scene_summary = normalizeString(detection?.scene_summary || '');
-    let detected_items = Array.isArray(detection?.detected_items) ? detection.detected_items : [];
+    let detected_items = safeArray(detection?.detected_items);
 
-    // Safety cleanup + item_ids
     detected_items = detected_items
       .filter(Boolean)
       .map((it, idx) => ({
-        item_id: it.item_id || `item_${String(idx + 1).padStart(2, '0')}`,
+        item_id: normalizeString(it.item_id || `item_${String(idx + 1).padStart(2, '0')}`),
         name: normalizeString(it.name || `Item ${idx + 1}`),
         object_type: normalizeString(it.object_type || 'object'),
         prominence: normalizeString(it.prominence || 'secondary'),
         quantity_estimate: Math.max(1, safeNum(it.quantity_estimate, 1)),
-        color_keywords: Array.isArray(it.color_keywords) ? it.color_keywords.map(String) : [],
-        material_keywords: Array.isArray(it.material_keywords) ? it.material_keywords.map(String) : [],
-        shape_keywords: Array.isArray(it.shape_keywords) ? it.shape_keywords.map(String) : [],
-        pattern_keywords: Array.isArray(it.pattern_keywords) ? it.pattern_keywords.map(String) : [],
+        color_keywords: safeArray(it.color_keywords).map(String),
+        material_keywords: safeArray(it.material_keywords).map(String),
+        shape_keywords: safeArray(it.shape_keywords).map(String),
+        pattern_keywords: safeArray(it.pattern_keywords).map(String),
         placement: normalizeString(it.placement || ''),
         notes: normalizeString(it.notes || '')
       }));
+
+    // De-dupe by item_id if model repeats
+    const seenItems = new Set();
+    detected_items = detected_items.filter((it) => {
+      if (!it.item_id || seenItems.has(it.item_id)) return false;
+      seenItems.add(it.item_id);
+      return true;
+    });
 
     log.push(`detected:${detected_items.length}`);
 
@@ -698,7 +846,6 @@ export default async function handler(req, res) {
         scene_summary,
         detected_items: [],
         item_matches: [],
-        items: [], // compatibility for existing frontend
         unmatched_items: [],
         lens_used: false,
         lens_total: 0,
@@ -706,9 +853,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // ─────────────────────────────────────────────
-    // STEP 2: Upload image (optional) for Google Lens
-    // ─────────────────────────────────────────────
+    // STEP 2: Upload image for Lens (optional but recommended)
     const imageUrl = await uploadImageForLens({
       cleanImageB64: cleanImage,
       log,
@@ -716,9 +861,7 @@ export default async function handler(req, res) {
       IMGBB_KEY
     });
 
-    // ─────────────────────────────────────────────
-    // STEP 3: Candidate search (Google Lens + Shopping text search per item)
-    // ─────────────────────────────────────────────
+    // STEP 3: Candidate search (Lens + Shopping text search per item)
     const lensCandidates = await serpGoogleLens({
       SERP_KEY,
       imageUrl,
@@ -727,18 +870,18 @@ export default async function handler(req, res) {
 
     const perItemCandidates = [];
     for (const item of detected_items) {
-      // Build stronger search query from item attributes
-      const queryParts = [
+      const queryParts = uniqueStrings([
         item.name,
-        ...(item.shape_keywords || []).slice(0, 2),
-        ...(item.material_keywords || []).slice(0, 2),
-        ...(item.color_keywords || []).slice(0, 2)
-      ].filter(Boolean);
+        ...safeArray(item.shape_keywords).slice(0, 2),
+        ...safeArray(item.pattern_keywords).slice(0, 2),
+        ...safeArray(item.material_keywords).slice(0, 2),
+        ...safeArray(item.color_keywords).slice(0, 2)
+      ]);
 
       const query = queryParts.join(' ').replace(/\s+/g, ' ').trim();
 
       const shoppingCandidates = SERP_KEY
-        ? await serpShoppingSearch({ SERP_KEY, query, log })
+        ? await serpShoppingSearch({ SERP_KEY, query, log, num: 10 })
         : [];
 
       const combined = buildCandidatePoolForItem(item, lensCandidates, shoppingCandidates);
@@ -746,7 +889,7 @@ export default async function handler(req, res) {
       perItemCandidates.push({
         item_id: item.item_id,
         item_name: item.name,
-        candidates: (combined || []).map((c) => ({
+        candidates: combined.map(c => ({
           candidate_id: c.id,
           title: c.title,
           source: c.source,
@@ -757,50 +900,50 @@ export default async function handler(req, res) {
         }))
       });
 
-      // Small delay for SerpAPI rate friendliness
-      if (SERP_KEY) await sleep(150);
+      if (SERP_KEY) await sleep(120);
     }
 
-    // ─────────────────────────────────────────────
-    // STEP 4: Exact verification pass (AI)
-    // ─────────────────────────────────────────────
-    const verify = await verifyExactMatchesPass({
-      OPENAI_KEY,
-      model: OPENAI_MODEL,
-      detectedItems: detected_items,
-      perItemCandidates,
-      log
-    });
+    // STEP 4: Exact verification pass
+    let verify = { item_matches: [] };
+    try {
+      verify = await verifyExactMatchesPass({
+        OPENAI_KEY,
+        model: OPENAI_MODEL,
+        detectedItems: detected_items,
+        perItemCandidates,
+        log
+      });
+    } catch (e) {
+      log.push('verify:fallback');
+      verify = { item_matches: [] };
+    }
 
-    let item_matches = Array.isArray(verify?.item_matches) ? verify.item_matches : [];
-
-    // Normalize + enforce candidate locking server-side (extra safety)
-    item_matches = item_matches.map((m) => ({
-      item_id: normalizeString(m.item_id),
-      item_name: normalizeString(m.item_name),
-      match_type: ['exact', 'near_exact', 'none'].includes(m.match_type) ? m.match_type : 'none',
-      confidence: Math.max(0, Math.min(100, safeNum(m.confidence, 0))),
-      exact_match: m.exact_match ? {
+    let item_matches = safeArray(verify?.item_matches).map(m => ({
+      item_id: normalizeString(m?.item_id),
+      item_name: normalizeString(m?.item_name),
+      match_type: ['exact', 'near_exact', 'none'].includes(m?.match_type) ? m.match_type : 'none',
+      confidence: Math.max(0, Math.min(100, safeNum(m?.confidence, 0))),
+      exact_match: m?.exact_match ? {
         candidate_id: normalizeString(m.exact_match.candidate_id),
         title: normalizeString(m.exact_match.title),
-        source: normalizeString(m.exact_match.source),
+        source: normalizeString(m.exact_match.source || inferRetailerFromUrl(m.exact_match.link || '')),
         link: normalizeString(m.exact_match.link),
         thumbnail: normalizeString(m.exact_match.thumbnail),
         price: safeNum(m.exact_match.price, 0)
       } : null,
-      evidence: Array.isArray(m.evidence) ? m.evidence.map(String).slice(0, 6) : [],
-      rejected_candidates: Array.isArray(m.rejected_candidates) ? m.rejected_candidates.slice(0, 8) : []
+      evidence: safeArray(m?.evidence).map(String).slice(0, 8),
+      rejected_candidates: safeArray(m?.rejected_candidates).slice(0, 10)
     }));
 
     item_matches = enforceCandidateLocking(item_matches);
 
-    // Fallback if verification omitted some items
-    const matchedIds = new Set(item_matches.map((m) => m.item_id));
+    // Fallback for omitted items: create "none" rows so every detected item appears
+    const matchedIds = new Set(item_matches.map(m => m.item_id).filter(Boolean));
     for (const item of detected_items) {
       if (matchedIds.has(item.item_id)) continue;
 
-      const pool = perItemCandidates.find((x) => x.item_id === item.item_id)?.candidates || [];
-      const top = pool[0];
+      const pool = safeArray(perItemCandidates.find(x => x.item_id === item.item_id)?.candidates);
+      const top = pool[0] || null;
 
       item_matches.push({
         item_id: item.item_id,
@@ -813,9 +956,17 @@ export default async function handler(req, res) {
       });
     }
 
-    // ─────────────────────────────────────────────
-    // STEP 5: Recommendations pass (AI)
-    // ─────────────────────────────────────────────
+    // Style anchors (NEW: exact-match anchored recommendations)
+    const styleAnchorsByItem = detected_items.map((item) => {
+      const match = item_matches.find(m => m.item_id === item.item_id) || null;
+      const anchor = extractStyleAnchor(item, match);
+      return {
+        item_id: item.item_id,
+        ...anchor
+      };
+    });
+
+    // STEP 5: Recommendation pass (AI), using style anchors
     let recs = { recommendations_by_item: [] };
     try {
       recs = await recommendationsPass({
@@ -825,26 +976,27 @@ export default async function handler(req, res) {
         detectedItems: detected_items,
         itemMatches: item_matches,
         perItemCandidates,
+        styleAnchorsByItem,
         log
       });
-    } catch (e) {
+    } catch (_) {
       log.push('recs:fallback');
       recs = { recommendations_by_item: [] };
     }
 
     const recMap = new Map();
-    for (const r of (recs?.recommendations_by_item || [])) {
-      const arr = Array.isArray(r?.recommended_items) ? r.recommended_items : [];
-      recMap.set(r.item_id, arr);
+    for (const r of safeArray(recs?.recommendations_by_item)) {
+      const arr = safeArray(r?.recommended_items);
+      if (r?.item_id) recMap.set(r.item_id, arr);
     }
 
-    // Final merged result
-    const finalItemMatches = item_matches.map((m) => {
-      const item = detected_items.find((x) => x.item_id === m.item_id) || null;
-      const perItem = perItemCandidates.find((x) => x.item_id === m.item_id);
-      const candidatePool = perItem?.candidates || [];
+    // Final merged response
+    const finalItemMatches = item_matches.map(m => {
+      const item = detected_items.find(x => x.item_id === m.item_id) || null;
+      const perItem = perItemCandidates.find(x => x.item_id === m.item_id) || null;
+      const candidatePool = safeArray(perItem?.candidates);
+      const styleAnchor = styleAnchorsByItem.find(x => x.item_id === m.item_id) || null;
 
-      // If no exact match, provide a fallback "best candidate" preview (not exact)
       let fallback_candidate = null;
       if (!m.exact_match && candidatePool.length > 0) {
         const c = candidatePool[0];
@@ -859,34 +1011,57 @@ export default async function handler(req, res) {
         };
       }
 
-      const recommendationsRaw = (recMap.get(m.item_id) || []).slice(0, 4);
+      let recommendationsRaw = safeArray(recMap.get(m.item_id)).slice(0, 4);
+
+      // Fallback recommendations if AI returns none
+      if (recommendationsRaw.length === 0 && item) {
+        recommendationsRaw = buildRecommendationFallback(item, m, styleAnchor);
+      }
+
       const recommendations = recommendationsRaw.map((x) => {
-        const source = normalizeString(x.source || 'Shop');
+        const source = normalizeString(x.source || inferRetailerFromUrl(x.search_url || '') || 'Shop');
         const title = normalizeString(x.title || item?.name || 'Recommended item');
-        const searchQuery = title;
+        const estimated_price = safeNum(x.estimated_price, 0);
+
+        // Keep user-provided/AI search URL if valid-ish, otherwise generate one
+        let search_url = normalizeString(x.search_url);
+        if (!search_url || !/^https?:\/\//i.test(search_url)) {
+          // Use style anchor first if we have exact match
+          const anchorQueryParts = uniqueStrings([
+            styleAnchor?.brand,
+            styleAnchor?.collection_hint,
+            ...safeArray(styleAnchor?.keywords).slice(0, 4),
+            item?.object_type,
+            title
+          ]).slice(0, 8);
+          const anchorQuery = anchorQueryParts.join(' ').trim() || title;
+          search_url = makeSearchUrl(source, anchorQuery);
+        }
+
         return {
           title,
           source,
-          search_url: normalizeString(x.search_url || makeSearchUrl(source, searchQuery)),
-          estimated_price: safeNum(x.estimated_price, 0),
-          why: normalizeString(x.why || 'Similar overall style and proportions')
+          search_url,
+          estimated_price,
+          why: normalizeString(x.why || 'Close match in shape/material/color and overall styling')
         };
       });
 
       return {
         ...m,
         detected_item: item,
+        style_anchor: styleAnchor,
         fallback_candidate,
         recommendations
       };
     });
 
     const unmatched_items = finalItemMatches
-      .filter((m) => m.match_type === 'none')
-      .map((m) => ({
+      .filter(m => m.match_type === 'none')
+      .map(m => ({
         item_id: m.item_id,
         item_name: m.item_name,
-        reason: (m.evidence && m.evidence[0]) || 'No verified match found',
+        reason: (safeArray(m.evidence)[0]) || 'No verified match found',
         fallback_candidate: m.fallback_candidate || null
       }));
 
@@ -894,12 +1069,12 @@ export default async function handler(req, res) {
       scene_summary,
       detected_items,
       item_matches: finalItemMatches,
-      items: finalItemMatches, // backward compatibility for older frontend code expecting "items"
       unmatched_items,
       lens_used: !!imageUrl,
-      lens_total: Array.isArray(lensCandidates) ? lensCandidates.length : 0,
+      lens_total: safeArray(lensCandidates).length,
       log: log.join(' | ')
     });
+
   } catch (err) {
     return res.status(500).json({
       error: err?.message || 'Analyze failed',
