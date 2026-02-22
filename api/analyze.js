@@ -1,4 +1,3 @@
-
 export const config = {
   api: {
     bodyParser: { sizeLimit: '10mb' },
@@ -6,114 +5,115 @@ export const config = {
   }
 };
 
-function safeNumber(v, fallback = 0) {
-  const n = Number(String(v ?? '').replace(/[^0-9.]/g, ''));
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function stripCodeFences(text) {
-  return String(text || '')
-    .replace(/```json\s*/gi, '')
-    .replace(/```\s*/g, '')
-    .trim();
-}
-
-function tryParseJson(text) {
-  const cleaned = stripCodeFences(text);
-  try {
-    return JSON.parse(cleaned);
-  } catch (e) {
-    // light repair for truncated JSON
-    let fixed = cleaned.replace(/,\s*$/, '');
-    const openBraces = (fixed.match(/{/g) || []).length;
-    const closeBraces = (fixed.match(/}/g) || []).length;
-    const openBrackets = (fixed.match(/\[/g) || []).length;
-    const closeBrackets = (fixed.match(/\]/g) || []).length;
-
-    for (let i = 0; i < openBrackets - closeBrackets; i++) fixed += ']';
-    for (let i = 0; i < openBraces - closeBraces; i++) fixed += '}';
-
-    return JSON.parse(fixed);
-  }
-}
-
-function buildRetailerSearchUrl(source, query) {
-  const q = encodeURIComponent(query || '');
-  const s = (source || '').toLowerCase();
-
-  if (s.includes('anthropologie')) return `https://www.anthropologie.com/search?q=${q}`;
-  if (s.includes('pottery')) return `https://www.potterybarn.com/search/results.html?words=${q}`;
-  if (s.includes('williams')) return `https://www.williams-sonoma.com/search/results.html?words=${q}`;
-  if (s.includes('west elm')) return `https://www.westelm.com/search/results.html?words=${q}`;
-  if (s.includes('crate')) return `https://www.crateandbarrel.com/search?query=${q}`;
-  if (s.includes('cb2')) return `https://www.cb2.com/search?query=${q}`;
-  if (s.includes('serena')) return `https://www.serenaandlily.com/search?q=${q}`;
-  if (s.includes('terrain')) return `https://www.terrain.com/search?q=${q}`;
-  if (s.includes('target')) return `https://www.target.com/s?searchTerm=${q}`;
-  if (s.includes('etsy')) return `https://www.etsy.com/search?q=${q}`;
-  if (s.includes('amazon')) return `https://www.amazon.com/s?k=${q}`;
-  if (s.includes('wayfair')) return `https://www.wayfair.com/keyword.php?keyword=${q}`;
-  if (s.includes('juliska')) return `https://www.juliska.com/search?type=product&q=${q}`;
-  if (s.includes('sur la table') || s.includes('surlatable')) return `https://www.surlatable.com/search/?q=${q}`;
-
-  // fallback generic Google Shopping search
-  return `https://www.google.com/search?tbm=shop&q=${q}`;
-}
-
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
-  const OPENAI_KEY = process.env.OPENAI_API_KEY;
+  const OPENAI_KEY = process.env.OPENAI_API_KEY; // switched to ChatGPT/OpenAI
   const SERP_KEY = process.env.SERPAPI_KEY;
 
   if (!OPENAI_KEY) {
     return res.status(500).json({ error: 'OPENAI_API_KEY not set' });
   }
 
-  let image, mediaType;
+  let image, mediaType, ltkProducts, shopmyProducts;
   try {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
     image = body.image;
     mediaType = body.mediaType || 'image/jpeg';
+    ltkProducts = Array.isArray(body.ltkProducts) ? body.ltkProducts : [];
+    shopmyProducts = Array.isArray(body.shopmyProducts) ? body.shopmyProducts : [];
   } catch (e) {
-    return res.status(400).json({ error: 'Invalid request body' });
+    return res.status(400).json({ error: 'Invalid request' });
   }
 
-  if (!image) return res.status(400).json({ error: 'No image provided' });
+  if (!image) return res.status(400).json({ error: 'No image' });
 
-  const cleanImage = String(image).replace(/^data:image\/\w+;base64,/, '');
+  const cleanImage = image.replace(/^data:image\/\w+;base64,/, '');
   const log = [];
-  let lensResults = [];
-  let imageUrl = null;
+
+  // ---------- small helpers ----------
+  function safeNum(v) {
+    const n = parseFloat(String(v ?? '').replace(/[^0-9.]/g, ''));
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function normalizeExternalProduct(p, sourceLabel) {
+    if (!p) return null;
+    const title = (p.title || p.product_name || p.name || '').trim();
+    const link = (p.link || p.url || p.product_link || p.affiliate_link || '').trim();
+    if (!title || !link) return null;
+
+    return {
+      id: p.id || null,
+      title,
+      source: sourceLabel,
+      retailer: (p.retailer || p.store || p.brand || '').trim(),
+      link,
+      thumbnail: (p.image || p.thumbnail || p.image_url || '').trim(),
+      price: safeNum(p.price || p.estimated_price || p.sale_price),
+      brand: (p.brand || '').trim(),
+      item_type: (p.item_type || '').trim(),
+      material: (p.material || '').trim(),
+      color: (p.color || '').trim(),
+      shape: (p.shape || '').trim(),
+      style_tags: Array.isArray(p.style_tags) ? p.style_tags.slice(0, 8) : []
+    };
+  }
+
+  function cleanupJsonText(text) {
+    if (!text) return '';
+    return String(text)
+      .replace(/```json\s*/gi, '')
+      .replace(/```\s*/g, '')
+      .trim();
+  }
+
+  function tryParseJson(text) {
+    const cleaned = cleanupJsonText(text);
+    try {
+      return JSON.parse(cleaned);
+    } catch (e) {
+      let fixed = cleaned.replace(/,\s*$/, '');
+
+      const openBraces = (fixed.match(/{/g) || []).length;
+      const closeBraces = (fixed.match(/}/g) || []).length;
+      const openBrackets = (fixed.match(/\[/g) || []).length;
+      const closeBrackets = (fixed.match(/\]/g) || []).length;
+
+      for (let i = 0; i < openBrackets - closeBrackets; i++) fixed += ']';
+      for (let i = 0; i < openBraces - closeBraces; i++) fixed += '}';
+
+      return JSON.parse(fixed);
+    }
+  }
 
   try {
-    // ──────────────────────────────────────────────
-    // STEP 1: Upload image so Google Lens (SerpAPI) can inspect it
-    // ──────────────────────────────────────────────
-    // Try freeimage.host first
+    // ═══════════════════════════════════════════════
+    // STEP 1: Upload image for Google Lens
+    // ═══════════════════════════════════════════════
+    let imageUrl = null;
+
+    // freeimage.host first
     try {
       const form = new URLSearchParams();
       form.append('source', cleanImage);
       form.append('type', 'base64');
       form.append('action', 'upload');
 
-      const r = await fetch(
-        'https://freeimage.host/api/1/upload?key=6d207e02198a847aa98d0a2a901485a5',
-        { method: 'POST', body: form }
-      );
+      const r = await fetch('https://freeimage.host/api/1/upload?key=6d207e02198a847aa98d0a2a901485a5', {
+        method: 'POST',
+        body: form
+      });
 
       if (r.ok) {
         const d = await r.json();
         if (d?.image?.url) {
           imageUrl = d.image.url;
           log.push('upload:freeimage');
-        } else {
-          log.push('freeimage:no-url');
         }
       } else {
         log.push('freeimage-fail:' + r.status);
@@ -129,18 +129,16 @@ export default async function handler(req, res) {
         form.append('image', cleanImage);
         form.append('expiration', '600');
 
-        const r = await fetch(
-          'https://api.imgbb.com/1/upload?key=5e87bda0a1f4270c0813577d712e84e0',
-          { method: 'POST', body: form }
-        );
+        const r = await fetch('https://api.imgbb.com/1/upload?key=5e87bda0a1f4270c0813577d712e84e0', {
+          method: 'POST',
+          body: form
+        });
 
         if (r.ok) {
           const d = await r.json();
           if (d?.data?.url) {
             imageUrl = d.data.url;
             log.push('upload:imgbb');
-          } else {
-            log.push('imgbb:no-url');
           }
         } else {
           log.push('imgbb-fail:' + r.status);
@@ -150,9 +148,11 @@ export default async function handler(req, res) {
       }
     }
 
-    // ──────────────────────────────────────────────
-    // STEP 2: Google Lens / SerpAPI results
-    // ──────────────────────────────────────────────
+    // ═══════════════════════════════════════════════
+    // STEP 2: Google Lens exact-match candidates
+    // ═══════════════════════════════════════════════
+    let lensResults = [];
+
     if (SERP_KEY && imageUrl) {
       try {
         const p = new URLSearchParams({
@@ -168,14 +168,13 @@ export default async function handler(req, res) {
           const d = await r.json();
 
           for (const vm of (d.visual_matches || []).slice(0, 40)) {
-            if (!vm?.link) continue;
+            if (!vm.link) continue;
             lensResults.push({
               title: vm.title || '',
-              link: vm.link || '',
+              link: vm.link,
               source: vm.source || '',
               thumbnail: vm.thumbnail || '',
-              price: vm.price ? safeNumber(vm.price.value || vm.price, 0) : 0,
-              origin: 'visual_match'
+              price: vm.price ? safeNum(vm.price.value || vm.price) : 0
             });
           }
 
@@ -187,130 +186,178 @@ export default async function handler(req, res) {
               link,
               source: sr.source || '',
               thumbnail: sr.thumbnail || '',
-              price: safeNumber(sr.extracted_price || sr.price, 0),
-              origin: 'shopping_result'
+              price: safeNum(sr.extracted_price || sr.price)
             });
           }
 
-          // Deduplicate by link
+          // dedupe by link
           const seen = new Set();
           lensResults = lensResults.filter((x) => {
-            const k = (x.link || '').trim();
-            if (!k || seen.has(k)) return false;
-            seen.add(k);
+            if (!x.link || seen.has(x.link)) return false;
+            seen.add(x.link);
             return true;
           });
 
-          log.push(`lens:${lensResults.length}`);
+          log.push('lens:' + lensResults.length + ' matches');
         } else {
           log.push('lens-fail:' + r.status);
         }
       } catch (e) {
         log.push('lens-err');
       }
-    } else {
-      if (!SERP_KEY) log.push('no-serp-key');
-      if (!imageUrl) log.push('no-upload-url');
     }
 
-    // ──────────────────────────────────────────────
-    // STEP 3: ChatGPT vision + strict exact-match logic
-    // ──────────────────────────────────────────────
-    const lensText = lensResults.length
-      ? lensResults
-          .map(
-            (r, i) =>
-              `${i}. ${r.title || 'Untitled'} | source: ${r.source || 'unknown'} | price: ${
-                r.price || ''
-              } | link: ${r.link}`
-          )
-          .join('\n')
-      : 'No Google Lens candidates available.';
+    // ═══════════════════════════════════════════════
+    // STEP 3: Normalize LTK + ShopMy candidate pools
+    // ═══════════════════════════════════════════════
+    const externalProducts = [];
+    for (const p of ltkProducts) {
+      const n = normalizeExternalProduct(p, 'LTK');
+      if (n) externalProducts.push(n);
+    }
+    for (const p of shopmyProducts) {
+      const n = normalizeExternalProduct(p, 'ShopMy');
+      if (n) externalProducts.push(n);
+    }
+
+    // Deduplicate external pool by link
+    const seenExternal = new Set();
+    const dedupedExternalProducts = externalProducts.filter((p) => {
+      const k = (p.link || '').toLowerCase();
+      if (!k || seenExternal.has(k)) return false;
+      seenExternal.add(k);
+      return true;
+    });
+
+    log.push('external:' + dedupedExternalProducts.length);
+
+    // Keep prompt size manageable
+    const lensPromptList = lensResults.slice(0, 35).map((r, i) => ({
+      lens_index: i,
+      title: r.title,
+      source: r.source,
+      link: r.link,
+      thumbnail: r.thumbnail,
+      price: r.price || 0
+    }));
+
+    const externalPromptList = dedupedExternalProducts.slice(0, 120).map((p, i) => ({
+      candidate_index: i,
+      source_pool: p.source, // LTK / ShopMy
+      title: p.title,
+      retailer: p.retailer || '',
+      brand: p.brand || '',
+      link: p.link,
+      thumbnail: p.thumbnail || '',
+      price: p.price || 0,
+      item_type: p.item_type || '',
+      material: p.material || '',
+      color: p.color || '',
+      shape: p.shape || '',
+      style_tags: p.style_tags || []
+    }));
+
+    // ═══════════════════════════════════════════════
+    // STEP 4: OpenAI (ChatGPT) identifies items + picks exact + similar
+    //         IMPORTANT: Similar items are chosen ONLY from provided pool
+    // ═══════════════════════════════════════════════
+    const promptText = `
+You are an expert visual merchandiser and home/tablescape product matcher.
+
+TASK
+1) Identify every SHOPS-RELEVANT item in the image (plates, chargers, napkins, glasses, flatware, linens, candlesticks, vases, lamps, pillows, decor, furniture, wallpaper, etc.)
+2) For each identified item, choose the BEST exact match from the Google Lens candidates (if truly exact/near-exact)
+3) For each identified item, choose 2-4 CLOSE similar products ONLY from the PROVIDED external candidate pool (LTK + ShopMy)
+4) Be strict. Recommendations must match object type first, then shape, color, material, and style.
+
+VERY IMPORTANT MATCHING RULES
+- NEVER match across object types (plate ≠ napkin, glass ≠ candle holder, wallpaper ≠ fabric, etc.)
+- Exact match should be null if no true exact/near-exact exists
+- Each Google Lens candidate may be used only ONCE as an exact match across all items
+- Similar recommendations must come ONLY from external_candidates (LTK/ShopMy). Do NOT invent products.
+- Prefer similarity in this order:
+  1. object_type
+  2. shape/silhouette (scalloped, fluted, coupe, round, pleated, etc.)
+  3. color and finish (emerald velvet, gold rim, matte glaze, clear cut crystal)
+  4. material (ceramic, linen, brass, glass, velvet)
+  5. style vibe (vintage, botanical, French cottage, coastal, traditional, etc.)
+- If external candidates are weak for an item, return fewer recommendations (even zero) rather than bad ones.
+
+OUTPUT FORMAT
+Return ONLY valid JSON in this exact shape:
+{
+  "items": [
+    {
+      "name": "Specific item name",
+      "order": 1,
+      "item_type": "plate|charger|napkin|glassware|flatware|tablecloth|vase|candleholder|wallpaper|lamp|pillow|rug|art|chair|table|other",
+      "attributes": {
+        "color": "main color",
+        "material": "material",
+        "shape": "shape/silhouette",
+        "finish": "finish/detail"
+      },
+      "styling_tip": "brief styling tip",
+      "exact_match": {
+        "lens_index": 0,
+        "confidence": 93,
+        "title": "Title copied from lens candidate",
+        "source": "Source copied from lens candidate",
+        "link": "URL copied from lens candidate",
+        "thumbnail": "Thumbnail copied from lens candidate",
+        "price": 0,
+        "evidence": ["why it matches", "why it matches"]
+      },
+      "similar_items": [
+        {
+          "candidate_index": 0,
+          "source_pool": "LTK",
+          "title": "Title copied from external candidate",
+          "retailer": "Retailer copied from external candidate",
+          "link": "URL copied from external candidate",
+          "thumbnail": "Thumbnail copied from external candidate",
+          "price": 0,
+          "why": "Specific reason this is similar"
+        }
+      ]
+    }
+  ],
+  "colors": [
+    {"name":"Color name","brand":"Benjamin Moore","code":"HC-172","hex":"#HEX"}
+  ],
+  "style_summary": "Brief style summary"
+}
+
+If no exact match exists for an item, set "exact_match": null.
+
+GOOGLE_LENS_CANDIDATES:
+${JSON.stringify(lensPromptList)}
+
+EXTERNAL_CANDIDATES (LTK + ShopMy only):
+${JSON.stringify(externalPromptList)}
+`.trim();
 
     const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: 'Bearer ' + OPENAI_KEY
+        'Authorization': 'Bearer ' + OPENAI_KEY
       },
       body: JSON.stringify({
-        model: 'gpt-4.1',
-        temperature: 0.15,
+        model: 'gpt-5',
+        temperature: 0.2,
         response_format: { type: 'json_object' },
         messages: [
           {
             role: 'system',
-            content:
-              'You are a luxury home and tablescape product matcher. Prioritize exactness over completeness. Never confuse object types (plate vs napkin vs glassware). If unsure, return no exact match.'
+            content: 'You are a strict product-matching assistant. Return only JSON.'
           },
           {
             role: 'user',
             content: [
               {
                 type: 'text',
-                text: `Analyze this inspiration image and identify distinct shoppable items.
-
-GOALS
-1) Identify each item (plate, charger, napkin, glassware, flatware, candles, linen, etc.)
-2) Choose the BEST exact match from Google Lens candidates ONLY if truly exact
-3) Recommend 2-3 VERY CLOSE alternatives (shape/material/color/trim should be close)
-
-STRICT RULES
-- Match object type first
-- Do not reuse the same Google Lens result for multiple items
-- If not truly exact, set exact_match = null
-- "Similar" items must be visually close, not just same theme
-- Confidence is 0-100 and should be honest
-
-APPROVED RETAILERS FOR SIMILARS
-Anthropologie, Pottery Barn, Williams Sonoma, West Elm, Crate & Barrel, CB2,
-Serena & Lily, McGee & Co, Rejuvenation, Schoolhouse, One Kings Lane, Arhaus,
-Terrain, Lulu and Georgia, Burke Decor, Ballard Designs, Etsy, Chairish,
-Target, Nordstrom, Bloomingdale's, Juliska, Vietri, MacKenzie-Childs,
-Sur La Table, Food52, Wayfair, Amazon, World Market, Replacements Ltd,
-East Fork, Heath Ceramics, Minted, Ruggable, Loloi
-
-GOOGLE LENS CANDIDATES
-${lensText}
-
-Return ONLY valid JSON:
-{
-  "item_matches": [
-    {
-      "item_id": "item_01",
-      "item_name": "scalloped ceramic dinner plate with clover motif and gold rim",
-      "item_type": "plate",
-      "match_type": "exact",
-      "confidence": 93,
-      "exact_match": {
-        "lens_index": 4,
-        "title": "Scalloped Stoneware Dinner Plate",
-        "source": "Anthropologie",
-        "link": "https://example.com",
-        "thumbnail": "",
-        "price": 38
-      },
-      "evidence": ["Object type matches plate", "Scalloped rim matches", "Gold trim and motif align"],
-      "rejected_candidates": [
-        { "lens_index": 2, "reason": "Glassware, wrong object type" }
-      ],
-      "styling_tip": "Pair with a solid charger so the motif stays the focal point.",
-      "similar_items": [
-        {
-          "title": "Botanical Scalloped Dinner Plate",
-          "source": "Anthropologie",
-          "search_url": "https://www.anthropologie.com/search?q=botanical%20scalloped%20dinner%20plate",
-          "estimated_price": 22,
-          "why": "Similar scalloped silhouette and hand-painted botanical feel"
-        }
-      ]
-    }
-  ],
-  "colors": [
-    { "name": "Emerald Green", "brand": "Generic", "code": "", "hex": "#0F5A43" }
-  ],
-  "style_summary": "Short style summary"
-}`
+                text: promptText
               },
               {
                 type: 'image_url',
@@ -325,98 +372,98 @@ Return ONLY valid JSON:
     });
 
     if (!openaiRes.ok) {
-      const errTxt = await openaiRes.text();
+      const errTxt = await openaiRes.text().catch(() => '');
       return res.status(500).json({
         error: 'OpenAI failed: ' + openaiRes.status,
-        details: errTxt,
+        details: errTxt.slice(0, 500),
         log: log.join(' | ')
       });
     }
 
     const openaiData = await openaiRes.json();
-    const aiText = openaiData?.choices?.[0]?.message?.content || '';
-    const identified = tryParseJson(aiText);
+    const modelText =
+      openaiData?.choices?.[0]?.message?.content ||
+      openaiData?.choices?.[0]?.message?.tool_calls?.[0]?.function?.arguments ||
+      '';
 
-    // Normalize AI shape
-    const itemMatches = Array.isArray(identified.item_matches)
-      ? identified.item_matches
-      : Array.isArray(identified.items)
-      ? identified.items
-      : [];
+    let identified;
+    try {
+      identified = tryParseJson(modelText);
+    } catch (e) {
+      return res.status(500).json({
+        error: 'Could not parse AI JSON response',
+        ai_preview: String(modelText).slice(0, 1000),
+        log: log.join(' | ')
+      });
+    }
 
-    log.push('ai_items:' + itemMatches.length);
+    log.push('items:' + ((identified.items || []).length));
 
-    // ──────────────────────────────────────────────
-    // STEP 4: Build UI-friendly results
-    // ──────────────────────────────────────────────
-    const usedLensIndexes = new Set();
-    const items = itemMatches.map((m, idx) => {
+    // ═══════════════════════════════════════════════
+    // STEP 5: Build final UI results (same-ish format as your current UI)
+    //         - exact comes from Google Lens
+    //         - similars come from LTK/ShopMy candidate pools
+    // ═══════════════════════════════════════════════
+    const items = (identified.items || []).map((item, idx) => {
       const products = [];
+      let exactCount = 0;
 
-      // exact match
-      let exactMatch = m.exact_match;
-      if (
-        exactMatch &&
-        typeof exactMatch === 'object' &&
-        typeof exactMatch.lens_index === 'number' &&
-        exactMatch.lens_index >= 0 &&
-        exactMatch.lens_index < lensResults.length &&
-        !usedLensIndexes.has(exactMatch.lens_index)
-      ) {
-        const lr = lensResults[exactMatch.lens_index];
-        usedLensIndexes.add(exactMatch.lens_index);
-
-        products.push({
-          title: lr.title || exactMatch.title || '',
-          price: lr.price || safeNumber(exactMatch.price, 0),
-          source: lr.source || exactMatch.source || '',
-          link: lr.link || exactMatch.link || '',
-          thumbnail: lr.thumbnail || exactMatch.thumbnail || '',
-          isExact: true
-        });
-      } else if (
-        exactMatch &&
-        exactMatch.link &&
-        typeof exactMatch.lens_index !== 'number'
-      ) {
-        // fallback if model returned a link but no valid index
-        products.push({
-          title: exactMatch.title || '',
-          price: safeNumber(exactMatch.price, 0),
-          source: exactMatch.source || '',
-          link: exactMatch.link || '',
-          thumbnail: exactMatch.thumbnail || '',
-          isExact: true
-        });
+      // Exact match from lens candidates
+      if (item.exact_match && typeof item.exact_match.lens_index === 'number') {
+        const i = item.exact_match.lens_index;
+        if (i >= 0 && i < lensPromptList.length) {
+          const lr = lensPromptList[i];
+          products.push({
+            title: lr.title || item.exact_match.title || '',
+            price: lr.price || item.exact_match.price || 0,
+            source: lr.source || item.exact_match.source || '',
+            link: lr.link || item.exact_match.link || '',
+            thumbnail: lr.thumbnail || item.exact_match.thumbnail || '',
+            isExact: true,
+            confidence: item.exact_match.confidence || 0,
+            evidence: Array.isArray(item.exact_match.evidence) ? item.exact_match.evidence : []
+          });
+          exactCount = 1;
+        }
       }
 
-      // similar items
-      for (const sim of (m.similar_items || []).slice(0, 5)) {
-        const title = sim?.title || '';
-        const source = sim?.source || '';
-        const query = title || m.item_name || '';
+      // Similars ONLY from external candidates
+      const usedLinks = new Set(products.map(p => (p.link || '').toLowerCase()));
+      for (const sim of (item.similar_items || []).slice(0, 6)) {
+        let chosen = null;
+
+        if (typeof sim.candidate_index === 'number' && sim.candidate_index >= 0 && sim.candidate_index < externalPromptList.length) {
+          chosen = externalPromptList[sim.candidate_index];
+        } else if (sim.link) {
+          // fallback link lookup
+          chosen = externalPromptList.find((p) => p.link === sim.link) || null;
+        }
+
+        if (!chosen) continue;
+        const linkKey = (chosen.link || '').toLowerCase();
+        if (!linkKey || usedLinks.has(linkKey)) continue;
+        usedLinks.add(linkKey);
+
         products.push({
-          title,
-          price: safeNumber(sim?.estimated_price, 0),
-          source,
-          link: sim?.search_url || buildRetailerSearchUrl(source, query),
-          thumbnail: '',
+          title: chosen.title || sim.title || '',
+          price: chosen.price || sim.price || 0,
+          source: chosen.source_pool || sim.source_pool || 'External',
+          retailer: chosen.retailer || sim.retailer || '',
+          link: chosen.link || sim.link || '',
+          thumbnail: chosen.thumbnail || sim.thumbnail || '',
           isExact: false,
-          why: sim?.why || ''
+          why: sim.why || ''
         });
       }
 
       return {
-        name: m.item_name || `Item ${idx + 1}`,
-        item_type: m.item_type || 'other',
-        order: idx + 1,
-        match_type: m.match_type || (products.some((p) => p.isExact) ? 'exact' : 'none'),
-        confidence: typeof m.confidence === 'number' ? m.confidence : 0,
-        evidence: Array.isArray(m.evidence) ? m.evidence : [],
-        rejected_candidates: Array.isArray(m.rejected_candidates) ? m.rejected_candidates : [],
-        styling_tip: m.styling_tip || '',
-        search_query: m.item_name || '',
-        exactCount: products.some((p) => p.isExact) ? 1 : 0,
+        name: item.name || `Item ${idx + 1}`,
+        order: item.order || idx + 1,
+        item_type: item.item_type || 'other',
+        attributes: item.attributes || {},
+        styling_tip: item.styling_tip || '',
+        search_query: item.name || '',
+        exactCount,
         products
       };
     });
@@ -427,12 +474,10 @@ Return ONLY valid JSON:
       style_summary: identified.style_summary || '',
       lens_used: !!imageUrl,
       lens_total: lensResults.length,
+      external_pool_total: dedupedExternalProducts.length,
       log: log.join(' | ')
     });
   } catch (err) {
-    return res.status(500).json({
-      error: err?.message || 'Unknown error',
-      log: log.join(' | ')
-    });
+    return res.status(500).json({ error: err.message, log: log.join(' | ') });
   }
 }
