@@ -344,7 +344,7 @@ ${JSON.stringify(externalPromptList)}
         'Authorization': 'Bearer ' + OPENAI_KEY
       },
       body: JSON.stringify({
-        model: 'gpt-5',
+        model: 'gpt-4o',
         temperature: 0.2,
         response_format: { type: 'json_object' },
         messages: [
