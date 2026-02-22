@@ -32,7 +32,7 @@ const ALLOWED_RETAILERS = [
   'Anthropologie', 'Pottery Barn', 'Williams Sonoma', 'West Elm', 'Crate & Barrel', 'CB2',
   'Serena & Lily', 'McGee & Co', 'Rejuvenation', 'Schoolhouse', 'One Kings Lane', 'Arhaus',
   'Terrain', 'Lulu and Georgia', 'Burke Decor', 'Ballard Designs', 'Etsy', 'Chairish',
-  'Target', 'Nordstrom', 'Bloomingdale\'s', 'Juliska', 'Vietri', 'MacKenzie-Childs',
+  'Target', 'Nordstrom', "Bloomingdale's", 'Juliska', 'Vietri', 'MacKenzie-Childs',
   'Sur La Table', 'Food52', 'Wayfair', 'Amazon', 'World Market', 'Replacements Ltd',
   'East Fork', 'Heath Ceramics', 'Minted', 'Ruggable', 'Loloi',
   // creator-commerce marketplaces user asked for
@@ -40,7 +40,7 @@ const ALLOWED_RETAILERS = [
 ];
 
 function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 function safeNum(n, fallback = 0) {
@@ -58,7 +58,7 @@ function tryParseJson(text) {
   let t = text.trim();
 
   // Remove markdown fences
-  t = t.replace(/^```json\s*/i, '').replace(/^```/, '').replace(/```$/,'').trim();
+  t = t.replace(/^```json\s*/i, '').replace(/^```/, '').replace(/```$/, '').trim();
 
   // Direct parse first
   try {
@@ -136,7 +136,7 @@ function scoreCandidateHeuristic(item, candidate) {
   if (itemType && candTitle.includes(itemType)) score += 25;
 
   // keyword overlap
-  const words = itemName.split(/[^a-z0-9]+/i).filter(w => w.length > 2);
+  const words = itemName.split(/[^a-z0-9]+/i).filter((w) => w.length > 2);
   const unique = [...new Set(words)];
   for (const w of unique) {
     if (candTitle.includes(w)) score += 5;
@@ -147,7 +147,7 @@ function scoreCandidateHeuristic(item, candidate) {
     ...(item?.shape_keywords || []),
     ...(item?.material_keywords || []),
     ...(item?.color_keywords || [])
-  ].map(x => String(x || '').toLowerCase());
+  ].map((x) => String(x || '').toLowerCase());
 
   for (const h of hints) {
     if (h && candTitle.includes(h)) score += 4;
@@ -334,16 +334,18 @@ async function serpShoppingSearch({ SERP_KEY, query, log }) {
     }
     const d = await r.json();
 
-    const results = (d.shopping_results || []).map((x, i) => ({
-      id: `shop_${i}_${Math.random().toString(36).slice(2, 6)}`,
-      source_type: 'shopping_search',
-      title: x.title || '',
-      source: x.source || '',
-      link: x.product_link || x.link || '',
-      thumbnail: x.thumbnail || '',
-      price: safeNum(x.extracted_price),
-      raw: x
-    })).filter(x => x.link);
+    const results = (d.shopping_results || [])
+      .map((x, i) => ({
+        id: `shop_${i}_${Math.random().toString(36).slice(2, 6)}`,
+        source_type: 'shopping_search',
+        title: x.title || '',
+        source: x.source || '',
+        link: x.product_link || x.link || '',
+        thumbnail: x.thumbnail || '',
+        price: safeNum(x.extracted_price),
+        raw: x
+      }))
+      .filter((x) => x.link);
 
     log.push(`shop:${results.length}`);
     return results;
@@ -357,7 +359,7 @@ function dedupeCandidates(candidates) {
   const seen = new Set();
   const out = [];
   for (const c of candidates || []) {
-    const key = (c.link || c.title || '').toLowerCase().trim();
+    const key = (c?.link || c?.title || '').toLowerCase().trim();
     if (!key || seen.has(key)) continue;
     seen.add(key);
     out.push(c);
@@ -375,15 +377,14 @@ function buildCandidatePoolForItem(item, lensCandidates, textSearchCandidates) {
 
 async function detectItemsPass({ OPENAI_KEY, model, imageDataUri, log }) {
   const system = `You are a visual product detection assistant for interior design and tablescape shopping.
-Your job is to identify all SHoppABLE visible objects (not walls/floor unless a wallpaper/rug is a clear style feature).
+Your job is to identify all shoppable visible objects (not walls/floor unless a wallpaper/rug is a clear style feature).
 Be exhaustive but avoid duplicates.
 Separate overlapping items (e.g., charger plate + dinner plate + salad plate + napkin + napkin ring + glassware).`;
 
-  const user = [
+  const userContent = [
     {
       type: 'text',
-      text:
-`Analyze this photo and detect visible shoppable items.
+      text: `Analyze this photo and detect visible shoppable items.
 
 Return ONLY JSON with this shape:
 {
@@ -423,7 +424,7 @@ Rules:
     model,
     messages: [
       { role: 'system', content: system },
-      { role: 'user', content: user }
+      { role: 'user', content: userContent }
     ],
     maxTokens: 2200,
     log,
@@ -480,11 +481,10 @@ Rules:
 4) "near_exact" = very close replacement if exact is unavailable.
 5) If no valid match, use match_type "none" and exact_match null.
 6) Be conservative and explain evidence.
-7) Prefer candidates whose title explicitly mentions key cues (shape/pattern/material).
-`;
+7) Prefer candidates whose title explicitly mentions key cues (shape/pattern/material).`;
 
   const payload = {
-    detected_items: detectedItems.map(i => ({
+    detected_items: (detectedItems || []).map((i) => ({
       item_id: i.item_id,
       name: i.name,
       object_type: i.object_type,
@@ -495,7 +495,7 @@ Rules:
       placement: i.placement || '',
       notes: i.notes || ''
     })),
-    candidates_by_item: perItemCandidates
+    candidates_by_item: perItemCandidates || []
   };
 
   const parsed = await openAIChatJSON({
@@ -526,7 +526,10 @@ function enforceCandidateLocking(itemMatches) {
       // If already used, downgrade to none
       clone.match_type = 'none';
       clone.confidence = Math.min(safeNum(clone.confidence, 0), 40);
-      clone.evidence = [...(clone.evidence || []), 'Candidate lock conflict: candidate was already assigned to another item'];
+      clone.evidence = [
+        ...(clone.evidence || []),
+        'Candidate lock conflict: candidate was already assigned to another item'
+      ];
       clone.rejected_candidates = [
         ...(clone.rejected_candidates || []),
         { candidate_id: cid, reason: 'Candidate already used by another item' }
@@ -581,12 +584,11 @@ Rules:
 - Include LTK / LikeToKnowIt and ShopMy when relevant.
 - Stay very close to the item style, especially if an exact/near-exact match exists.
 - If item is highly specific, prefer fewer but better recommendations.
-- Use real retailer names and valid search URLs (site search URLs are okay).
-`;
+- Use real retailer names and valid search URLs (site search URLs are okay).`;
 
   const compact = {
     scene_summary: sceneSummary || '',
-    detected_items: detectedItems.map(i => ({
+    detected_items: (detectedItems || []).map((i) => ({
       item_id: i.item_id,
       name: i.name,
       object_type: i.object_type,
@@ -595,16 +597,16 @@ Rules:
       shape_keywords: i.shape_keywords || [],
       pattern_keywords: i.pattern_keywords || []
     })),
-    item_matches: itemMatches.map(m => ({
+    item_matches: (itemMatches || []).map((m) => ({
       item_id: m.item_id,
       item_name: m.item_name,
       match_type: m.match_type,
       confidence: m.confidence,
-      exact_match: m.exact_match
+      exact_match: m.exact_match || null
     })),
-    candidate_titles_by_item: perItemCandidates.map(x => ({
+    candidate_titles_by_item: (perItemCandidates || []).map((x) => ({
       item_id: x.item_id,
-      candidates: (x.candidates || []).slice(0, 8).map(c => ({
+      candidates: (x.candidates || []).slice(0, 8).map((c) => ({
         title: c.title,
         source: c.source,
         price: c.price
@@ -649,8 +651,8 @@ export default async function handler(req, res) {
   const body = await readJsonBody(req, res);
   if (!body) return;
 
-  let image = body.image;
-  let mediaType = body.mediaType || 'image/jpeg';
+  const image = body.image;
+  const mediaType = body.mediaType || 'image/jpeg';
   const log = [];
 
   if (!image) return res.status(400).json({ error: 'No image provided' });
@@ -669,8 +671,8 @@ export default async function handler(req, res) {
       log
     });
 
-    const scene_summary = normalizeString(detection.scene_summary || '');
-    let detected_items = Array.isArray(detection.detected_items) ? detection.detected_items : [];
+    const scene_summary = normalizeString(detection?.scene_summary || '');
+    let detected_items = Array.isArray(detection?.detected_items) ? detection.detected_items : [];
 
     // Safety cleanup + item_ids
     detected_items = detected_items
@@ -696,6 +698,7 @@ export default async function handler(req, res) {
         scene_summary,
         detected_items: [],
         item_matches: [],
+        items: [], // compatibility for existing frontend
         unmatched_items: [],
         lens_used: false,
         lens_total: 0,
@@ -743,7 +746,7 @@ export default async function handler(req, res) {
       perItemCandidates.push({
         item_id: item.item_id,
         item_name: item.name,
-        candidates: combined.map(c => ({
+        candidates: (combined || []).map((c) => ({
           candidate_id: c.id,
           title: c.title,
           source: c.source,
@@ -761,7 +764,7 @@ export default async function handler(req, res) {
     // ─────────────────────────────────────────────
     // STEP 4: Exact verification pass (AI)
     // ─────────────────────────────────────────────
-    let verify = await verifyExactMatchesPass({
+    const verify = await verifyExactMatchesPass({
       OPENAI_KEY,
       model: OPENAI_MODEL,
       detectedItems: detected_items,
@@ -769,10 +772,10 @@ export default async function handler(req, res) {
       log
     });
 
-    let item_matches = Array.isArray(verify.item_matches) ? verify.item_matches : [];
+    let item_matches = Array.isArray(verify?.item_matches) ? verify.item_matches : [];
 
     // Normalize + enforce candidate locking server-side (extra safety)
-    item_matches = item_matches.map(m => ({
+    item_matches = item_matches.map((m) => ({
       item_id: normalizeString(m.item_id),
       item_name: normalizeString(m.item_name),
       match_type: ['exact', 'near_exact', 'none'].includes(m.match_type) ? m.match_type : 'none',
@@ -792,11 +795,11 @@ export default async function handler(req, res) {
     item_matches = enforceCandidateLocking(item_matches);
 
     // Fallback if verification omitted some items
-    const matchedIds = new Set(item_matches.map(m => m.item_id));
+    const matchedIds = new Set(item_matches.map((m) => m.item_id));
     for (const item of detected_items) {
       if (matchedIds.has(item.item_id)) continue;
 
-      const pool = perItemCandidates.find(x => x.item_id === item.item_id)?.candidates || [];
+      const pool = perItemCandidates.find((x) => x.item_id === item.item_id)?.candidates || [];
       const top = pool[0];
 
       item_matches.push({
@@ -830,15 +833,15 @@ export default async function handler(req, res) {
     }
 
     const recMap = new Map();
-    for (const r of (recs.recommendations_by_item || [])) {
-      const arr = Array.isArray(r.recommended_items) ? r.recommended_items : [];
+    for (const r of (recs?.recommendations_by_item || [])) {
+      const arr = Array.isArray(r?.recommended_items) ? r.recommended_items : [];
       recMap.set(r.item_id, arr);
     }
 
     // Final merged result
-    const finalItemMatches = item_matches.map(m => {
-      const item = detected_items.find(x => x.item_id === m.item_id);
-      const perItem = perItemCandidates.find(x => x.item_id === m.item_id);
+    const finalItemMatches = item_matches.map((m) => {
+      const item = detected_items.find((x) => x.item_id === m.item_id) || null;
+      const perItem = perItemCandidates.find((x) => x.item_id === m.item_id);
       const candidatePool = perItem?.candidates || [];
 
       // If no exact match, provide a fallback "best candidate" preview (not exact)
@@ -872,15 +875,15 @@ export default async function handler(req, res) {
 
       return {
         ...m,
-        detected_item: item || null,
+        detected_item: item,
         fallback_candidate,
         recommendations
       };
     });
 
     const unmatched_items = finalItemMatches
-      .filter(m => m.match_type === 'none')
-      .map(m => ({
+      .filter((m) => m.match_type === 'none')
+      .map((m) => ({
         item_id: m.item_id,
         item_name: m.item_name,
         reason: (m.evidence && m.evidence[0]) || 'No verified match found',
@@ -891,15 +894,15 @@ export default async function handler(req, res) {
       scene_summary,
       detected_items,
       item_matches: finalItemMatches,
+      items: finalItemMatches, // backward compatibility for older frontend code expecting "items"
       unmatched_items,
       lens_used: !!imageUrl,
-      lens_total: lensCandidates.length,
+      lens_total: Array.isArray(lensCandidates) ? lensCandidates.length : 0,
       log: log.join(' | ')
     });
-
   } catch (err) {
     return res.status(500).json({
-      error: err.message || 'Analyze failed',
+      error: err?.message || 'Analyze failed',
       log: log.join(' | ')
     });
   }
