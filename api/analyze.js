@@ -1,3 +1,4 @@
+
 export const config = {
   api: {
     bodyParser: { sizeLimit: '10mb' },
@@ -5,15 +6,74 @@ export const config = {
   }
 };
 
+function safeNumber(v, fallback = 0) {
+  const n = Number(String(v ?? '').replace(/[^0-9.]/g, ''));
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function stripCodeFences(text) {
+  return String(text || '')
+    .replace(/```json\s*/gi, '')
+    .replace(/```\s*/g, '')
+    .trim();
+}
+
+function tryParseJson(text) {
+  const cleaned = stripCodeFences(text);
+  try {
+    return JSON.parse(cleaned);
+  } catch (e) {
+    // light repair for truncated JSON
+    let fixed = cleaned.replace(/,\s*$/, '');
+    const openBraces = (fixed.match(/{/g) || []).length;
+    const closeBraces = (fixed.match(/}/g) || []).length;
+    const openBrackets = (fixed.match(/\[/g) || []).length;
+    const closeBrackets = (fixed.match(/\]/g) || []).length;
+
+    for (let i = 0; i < openBrackets - closeBrackets; i++) fixed += ']';
+    for (let i = 0; i < openBraces - closeBraces; i++) fixed += '}';
+
+    return JSON.parse(fixed);
+  }
+}
+
+function buildRetailerSearchUrl(source, query) {
+  const q = encodeURIComponent(query || '');
+  const s = (source || '').toLowerCase();
+
+  if (s.includes('anthropologie')) return `https://www.anthropologie.com/search?q=${q}`;
+  if (s.includes('pottery')) return `https://www.potterybarn.com/search/results.html?words=${q}`;
+  if (s.includes('williams')) return `https://www.williams-sonoma.com/search/results.html?words=${q}`;
+  if (s.includes('west elm')) return `https://www.westelm.com/search/results.html?words=${q}`;
+  if (s.includes('crate')) return `https://www.crateandbarrel.com/search?query=${q}`;
+  if (s.includes('cb2')) return `https://www.cb2.com/search?query=${q}`;
+  if (s.includes('serena')) return `https://www.serenaandlily.com/search?q=${q}`;
+  if (s.includes('terrain')) return `https://www.terrain.com/search?q=${q}`;
+  if (s.includes('target')) return `https://www.target.com/s?searchTerm=${q}`;
+  if (s.includes('etsy')) return `https://www.etsy.com/search?q=${q}`;
+  if (s.includes('amazon')) return `https://www.amazon.com/s?k=${q}`;
+  if (s.includes('wayfair')) return `https://www.wayfair.com/keyword.php?keyword=${q}`;
+  if (s.includes('juliska')) return `https://www.juliska.com/search?type=product&q=${q}`;
+  if (s.includes('sur la table') || s.includes('surlatable')) return `https://www.surlatable.com/search/?q=${q}`;
+
+  // fallback generic Google Shopping search
+  return `https://www.google.com/search?tbm=shop&q=${q}`;
+}
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
-  const CLAUDE_KEY = process.env.CLAUDE_API_KEY;
+  const OPENAI_KEY = process.env.OPENAI_API_KEY;
   const SERP_KEY = process.env.SERPAPI_KEY;
+
+  if (!OPENAI_KEY) {
+    return res.status(500).json({ error: 'OPENAI_API_KEY not set' });
+  }
 
   let image, mediaType;
   try {
@@ -21,33 +81,46 @@ export default async function handler(req, res) {
     image = body.image;
     mediaType = body.mediaType || 'image/jpeg';
   } catch (e) {
-    return res.status(400).json({ error: 'Invalid request' });
+    return res.status(400).json({ error: 'Invalid request body' });
   }
-  if (!image) return res.status(400).json({ error: 'No image' });
 
-  const cleanImage = image.replace(/^data:image\/\w+;base64,/, '');
+  if (!image) return res.status(400).json({ error: 'No image provided' });
+
+  const cleanImage = String(image).replace(/^data:image\/\w+;base64,/, '');
   const log = [];
+  let lensResults = [];
+  let imageUrl = null;
 
   try {
-    // ═══════════════════════════════════════════════
-    // STEP 1: Upload image for Google Lens
-    // ═══════════════════════════════════════════════
-    let imageUrl = null;
-
-    // Try freeimage first (imgbb has been failing)
+    // ──────────────────────────────────────────────
+    // STEP 1: Upload image so Google Lens (SerpAPI) can inspect it
+    // ──────────────────────────────────────────────
+    // Try freeimage.host first
     try {
       const form = new URLSearchParams();
       form.append('source', cleanImage);
       form.append('type', 'base64');
       form.append('action', 'upload');
-      const r = await fetch('https://freeimage.host/api/1/upload?key=6d207e02198a847aa98d0a2a901485a5', {
-        method: 'POST', body: form
-      });
+
+      const r = await fetch(
+        'https://freeimage.host/api/1/upload?key=6d207e02198a847aa98d0a2a901485a5',
+        { method: 'POST', body: form }
+      );
+
       if (r.ok) {
         const d = await r.json();
-        if (d.image && d.image.url) { imageUrl = d.image.url; log.push('upload:freeimage'); }
-      } else { log.push('freeimage-fail:' + r.status); }
-    } catch (e) { log.push('freeimage-err'); }
+        if (d?.image?.url) {
+          imageUrl = d.image.url;
+          log.push('upload:freeimage');
+        } else {
+          log.push('freeimage:no-url');
+        }
+      } else {
+        log.push('freeimage-fail:' + r.status);
+      }
+    } catch (e) {
+      log.push('freeimage-err');
+    }
 
     // Backup: imgbb
     if (!imageUrl) {
@@ -55,255 +128,311 @@ export default async function handler(req, res) {
         const form = new URLSearchParams();
         form.append('image', cleanImage);
         form.append('expiration', '600');
-        const r = await fetch('https://api.imgbb.com/1/upload?key=5e87bda0a1f4270c0813577d712e84e0', {
-          method: 'POST', body: form
-        });
+
+        const r = await fetch(
+          'https://api.imgbb.com/1/upload?key=5e87bda0a1f4270c0813577d712e84e0',
+          { method: 'POST', body: form }
+        );
+
         if (r.ok) {
           const d = await r.json();
-          if (d.data && d.data.url) { imageUrl = d.data.url; log.push('upload:imgbb'); }
-        } else { log.push('imgbb-fail:' + r.status); }
-      } catch (e) { log.push('imgbb-err'); }
+          if (d?.data?.url) {
+            imageUrl = d.data.url;
+            log.push('upload:imgbb');
+          } else {
+            log.push('imgbb:no-url');
+          }
+        } else {
+          log.push('imgbb-fail:' + r.status);
+        }
+      } catch (e) {
+        log.push('imgbb-err');
+      }
     }
 
-    // ═══════════════════════════════════════════════
-    // STEP 2: Google Lens - find ALL visual matches
-    // ═══════════════════════════════════════════════
-    let lensResults = [];
-
+    // ──────────────────────────────────────────────
+    // STEP 2: Google Lens / SerpAPI results
+    // ──────────────────────────────────────────────
     if (SERP_KEY && imageUrl) {
       try {
         const p = new URLSearchParams({
-          engine: 'google_lens', url: imageUrl,
-          api_key: SERP_KEY, hl: 'en', country: 'us'
+          engine: 'google_lens',
+          url: imageUrl,
+          api_key: SERP_KEY,
+          hl: 'en',
+          country: 'us'
         });
+
         const r = await fetch('https://serpapi.com/search.json?' + p.toString());
         if (r.ok) {
           const d = await r.json();
-          for (const vm of (d.visual_matches || []).slice(0, 30)) {
-            if (!vm.link) continue;
+
+          for (const vm of (d.visual_matches || []).slice(0, 40)) {
+            if (!vm?.link) continue;
             lensResults.push({
-              title: vm.title || '', link: vm.link,
-              source: vm.source || '', thumbnail: vm.thumbnail || '',
-              price: vm.price ? parseFloat(String(vm.price.value || vm.price).replace(/[^0-9.]/g, '')) : 0
+              title: vm.title || '',
+              link: vm.link || '',
+              source: vm.source || '',
+              thumbnail: vm.thumbnail || '',
+              price: vm.price ? safeNumber(vm.price.value || vm.price, 0) : 0,
+              origin: 'visual_match'
             });
           }
-          for (const sr of (d.shopping_results || []).slice(0, 10)) {
-            if (!sr.link) continue;
+
+          for (const sr of (d.shopping_results || []).slice(0, 20)) {
+            const link = sr.link || sr.product_link || '';
+            if (!link) continue;
             lensResults.push({
-              title: sr.title || '', link: sr.link || sr.product_link || '',
-              source: sr.source || '', thumbnail: sr.thumbnail || '',
-              price: sr.extracted_price || 0
+              title: sr.title || '',
+              link,
+              source: sr.source || '',
+              thumbnail: sr.thumbnail || '',
+              price: safeNumber(sr.extracted_price || sr.price, 0),
+              origin: 'shopping_result'
             });
           }
-          log.push('lens:' + lensResults.length + ' matches');
+
+          // Deduplicate by link
+          const seen = new Set();
+          lensResults = lensResults.filter((x) => {
+            const k = (x.link || '').trim();
+            if (!k || seen.has(k)) return false;
+            seen.add(k);
+            return true;
+          });
+
+          log.push(`lens:${lensResults.length}`);
+        } else {
+          log.push('lens-fail:' + r.status);
         }
-      } catch (e) { log.push('lens-err'); }
+      } catch (e) {
+        log.push('lens-err');
+      }
+    } else {
+      if (!SERP_KEY) log.push('no-serp-key');
+      if (!imageUrl) log.push('no-upload-url');
     }
 
-    // ═══════════════════════════════════════════════
-    // STEP 3: Claude identifies items + Lens gives exact match
-    //         Then Claude recommends similar from approved stores
-    // ═══════════════════════════════════════════════
-    const lensContext = lensResults.length > 0
-      ? '\n\nGoogle Lens found these products matching this image:\n' +
-        lensResults.map((r, i) =>
-          i + '. "' + r.title + '" from ' + r.source + (r.price ? ' ($' + r.price + ')' : '') + ' - ' + r.link
-        ).join('\n')
-      : '';
+    // ──────────────────────────────────────────────
+    // STEP 3: ChatGPT vision + strict exact-match logic
+    // ──────────────────────────────────────────────
+    const lensText = lensResults.length
+      ? lensResults
+          .map(
+            (r, i) =>
+              `${i}. ${r.title || 'Untitled'} | source: ${r.source || 'unknown'} | price: ${
+                r.price || ''
+              } | link: ${r.link}`
+          )
+          .join('\n')
+      : 'No Google Lens candidates available.';
 
-    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+    const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key': CLAUDE_KEY,
-        'anthropic-version': '2023-06-01'
+        Authorization: 'Bearer ' + OPENAI_KEY
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-5-20250929',
-        max_tokens: 8000,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: mediaType, data: cleanImage } },
-            { type: 'text', text: `You are a luxury home and lifestyle product expert and personal shopper.
+        model: 'gpt-4.1',
+        temperature: 0.15,
+        response_format: { type: 'json_object' },
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are a luxury home and tablescape product matcher. Prioritize exactness over completeness. Never confuse object types (plate vs napkin vs glassware). If unsure, return no exact match.'
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: `Analyze this inspiration image and identify distinct shoppable items.
 
-STEP 1: Identify every shoppable item in this image.
-STEP 2: For each item, find the BEST exact match from the Google Lens results below.
-STEP 3: For each item, recommend 2-3 SIMILAR products from these APPROVED RETAILERS ONLY:
-  Anthropologie, Pottery Barn, Williams Sonoma, West Elm, Crate & Barrel, CB2,
-  Serena & Lily, McGee & Co, Rejuvenation, Schoolhouse, One Kings Lane, Arhaus,
-  Terrain, Lulu and Georgia, Burke Decor, Ballard Designs, Etsy, Chairish,
-  Target (Hearth & Hand / Threshold), Nordstrom, Bloomingdale's, Juliska, Vietri,
-  MacKenzie-Childs, Sur La Table, Food52, Wayfair, Amazon, World Market,
-  Replacements Ltd, East Fork, Heath Ceramics, Minted, Ruggable, Loloi
-${lensContext}
+GOALS
+1) Identify each item (plate, charger, napkin, glassware, flatware, candles, linen, etc.)
+2) Choose the BEST exact match from Google Lens candidates ONLY if truly exact
+3) Recommend 2-3 VERY CLOSE alternatives (shape/material/color/trim should be close)
+
+STRICT RULES
+- Match object type first
+- Do not reuse the same Google Lens result for multiple items
+- If not truly exact, set exact_match = null
+- "Similar" items must be visually close, not just same theme
+- Confidence is 0-100 and should be honest
+
+APPROVED RETAILERS FOR SIMILARS
+Anthropologie, Pottery Barn, Williams Sonoma, West Elm, Crate & Barrel, CB2,
+Serena & Lily, McGee & Co, Rejuvenation, Schoolhouse, One Kings Lane, Arhaus,
+Terrain, Lulu and Georgia, Burke Decor, Ballard Designs, Etsy, Chairish,
+Target, Nordstrom, Bloomingdale's, Juliska, Vietri, MacKenzie-Childs,
+Sur La Table, Food52, Wayfair, Amazon, World Market, Replacements Ltd,
+East Fork, Heath Ceramics, Minted, Ruggable, Loloi
+
+GOOGLE LENS CANDIDATES
+${lensText}
 
 Return ONLY valid JSON:
 {
-  "items": [
+  "item_matches": [
     {
-      "name": "Very specific product name with brand if known",
-      "order": 1,
-      "styling_tip": "brief styling tip",
+      "item_id": "item_01",
+      "item_name": "scalloped ceramic dinner plate with clover motif and gold rim",
+      "item_type": "plate",
+      "match_type": "exact",
+      "confidence": 93,
       "exact_match": {
-        "title": "Best matching product title from Google Lens",
-        "source": "Source website name",
-        "link": "Full URL from lens results",
-        "thumbnail": "Thumbnail URL if available",
-        "price": 0,
-        "lens_index": 0
+        "lens_index": 4,
+        "title": "Scalloped Stoneware Dinner Plate",
+        "source": "Anthropologie",
+        "link": "https://example.com",
+        "thumbnail": "",
+        "price": 38
       },
+      "evidence": ["Object type matches plate", "Scalloped rim matches", "Gold trim and motif align"],
+      "rejected_candidates": [
+        { "lens_index": 2, "reason": "Glassware, wrong object type" }
+      ],
+      "styling_tip": "Pair with a solid charger so the motif stays the focal point.",
       "similar_items": [
-        {"title": "Product name", "source": "Anthropologie", "search_url": "https://www.anthropologie.com/search?q=QUERY", "estimated_price": 48, "why": "Similar style"}
+        {
+          "title": "Botanical Scalloped Dinner Plate",
+          "source": "Anthropologie",
+          "search_url": "https://www.anthropologie.com/search?q=botanical%20scalloped%20dinner%20plate",
+          "estimated_price": 22,
+          "why": "Similar scalloped silhouette and hand-painted botanical feel"
+        }
       ]
     }
   ],
-  "colors": [{"name": "Paint Name", "brand": "Benjamin Moore", "code": "HC-172", "hex": "#hex"}],
-  "style_summary": "Brief style description"
-}
-
-CRITICAL RULES:
-1. exact_match MUST use the actual link and title from the Google Lens results above
-   CRITICAL: Only match a Lens result to an item if it is actually THAT item. A plate result should NOT be the exact_match for napkins or glasses. If no Lens result matches this specific item, set exact_match to null.
-   Each Lens result should only be used ONCE across all items — do not reuse the same result for multiple items.
-2. For similar_items, recommend REAL products you know exist at approved retailers
-3. Build search URLs for each retailer like:
-   - Anthropologie: https://www.anthropologie.com/search?q=QUERY
-   - Pottery Barn: https://www.potterybarn.com/search/results.html?words=QUERY
-   - Williams Sonoma: https://www.williams-sonoma.com/search/results.html?words=QUERY
-   - West Elm: https://www.westelm.com/search/results.html?words=QUERY
-   - Crate & Barrel: https://www.crateandbarrel.com/search?query=QUERY
-   - Target: https://www.target.com/s?searchTerm=QUERY
-   - Etsy: https://www.etsy.com/search?q=QUERY
-   - Amazon: https://www.amazon.com/s?k=QUERY
-   - Wayfair: https://www.wayfair.com/keyword.php?keyword=QUERY
-   - Serena & Lily: https://www.serenaandlily.com/search?q=QUERY
-   - Juliska: https://www.juliska.com/search?type=product&q=QUERY
-   - Sur La Table: https://www.surlatable.com/search/?q=QUERY
-4. Each similar item should match the STYLE, COLOR, and FEEL of the original
-5. Include a brief "why" for each recommendation explaining the similarity
-6. Return ONLY JSON` }
-          ]
-        }]
+  "colors": [
+    { "name": "Emerald Green", "brand": "Generic", "code": "", "hex": "#0F5A43" }
+  ],
+  "style_summary": "Short style summary"
+}`
+              },
+              {
+                type: 'image_url',
+                image_url: {
+                  url: `data:${mediaType};base64,${cleanImage}`
+                }
+              }
+            ]
+          }
+        ]
       })
     });
 
-    if (!claudeRes.ok) {
-      return res.status(500).json({ error: 'Claude failed: ' + claudeRes.status, log: log.join(' | ') });
+    if (!openaiRes.ok) {
+      const errTxt = await openaiRes.text();
+      return res.status(500).json({
+        error: 'OpenAI failed: ' + openaiRes.status,
+        details: errTxt,
+        log: log.join(' | ')
+      });
     }
 
-    const claudeData = await claudeRes.json();
-    let claudeText = claudeData.content[0].text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    
-    // Fix truncated JSON - try to close any open brackets
-    let identified;
-    try {
-      identified = JSON.parse(claudeText);
-    } catch (e) {
-      // Try to fix truncated JSON
-      let fixed = claudeText;
-      // Count open/close brackets
-      const openBraces = (fixed.match(/{/g) || []).length;
-      const closeBraces = (fixed.match(/}/g) || []).length;
-      const openBrackets = (fixed.match(/\[/g) || []).length;
-      const closeBrackets = (fixed.match(/\]/g) || []).length;
-      
-      // Remove any trailing comma
-      fixed = fixed.replace(/,\s*$/, '');
-      
-      // Close arrays then objects
-      for (let i = 0; i < openBrackets - closeBrackets; i++) fixed += ']';
-      for (let i = 0; i < openBraces - closeBraces; i++) fixed += '}';
-      
-      try {
-        identified = JSON.parse(fixed);
-      } catch (e2) {
-        // Last resort: extract just the items array
-        const itemsMatch = claudeText.match(/"items"\s*:\s*\[/);
-        if (itemsMatch) {
-          const start = itemsMatch.index + itemsMatch[0].length;
-          // Find complete item objects
-          const items = [];
-          let depth = 1;
-          let objStart = start;
-          for (let i = start; i < claudeText.length && depth > 0; i++) {
-            if (claudeText[i] === '{') { if (depth === 1) objStart = i; depth++; }
-            else if (claudeText[i] === '}') { depth--; if (depth === 1) { try { items.push(JSON.parse(claudeText.substring(objStart, i + 1))); } catch(e3){} } }
-            else if (claudeText[i] === ']') { depth--; }
-          }
-          identified = { items: items, colors: [], style_summary: '' };
-        } else {
-          throw new Error('Could not parse Claude response');
-        }
-      }
-    }
-    log.push('items:' + (identified.items || []).length);
+    const openaiData = await openaiRes.json();
+    const aiText = openaiData?.choices?.[0]?.message?.content || '';
+    const identified = tryParseJson(aiText);
 
-    // ═══════════════════════════════════════════════
-    // STEP 4: Build final results
-    // ═══════════════════════════════════════════════
-    const items = (identified.items || []).map(item => {
+    // Normalize AI shape
+    const itemMatches = Array.isArray(identified.item_matches)
+      ? identified.item_matches
+      : Array.isArray(identified.items)
+      ? identified.items
+      : [];
+
+    log.push('ai_items:' + itemMatches.length);
+
+    // ──────────────────────────────────────────────
+    // STEP 4: Build UI-friendly results
+    // ──────────────────────────────────────────────
+    const usedLensIndexes = new Set();
+    const items = itemMatches.map((m, idx) => {
       const products = [];
 
-      // First: the exact match from Google Lens (only if Claude found a real match)
-      if (item.exact_match && item.exact_match.link && item.exact_match.link !== 'null') {
-        const em = item.exact_match;
-        // Try to get the real lens result data
-        if (typeof em.lens_index === 'number' && em.lens_index >= 0 && em.lens_index < lensResults.length) {
-          const lr = lensResults[em.lens_index];
-          products.push({
-            title: lr.title || em.title,
-            price: lr.price || em.price || 0,
-            source: lr.source || em.source,
-            link: lr.link || em.link,
-            thumbnail: lr.thumbnail || em.thumbnail || '',
-            isExact: true
-          });
-        } else {
-          products.push({
-            title: em.title || '',
-            price: em.price || 0,
-            source: em.source || '',
-            link: em.link || '',
-            thumbnail: em.thumbnail || '',
-            isExact: true
-          });
-        }
+      // exact match
+      let exactMatch = m.exact_match;
+      if (
+        exactMatch &&
+        typeof exactMatch === 'object' &&
+        typeof exactMatch.lens_index === 'number' &&
+        exactMatch.lens_index >= 0 &&
+        exactMatch.lens_index < lensResults.length &&
+        !usedLensIndexes.has(exactMatch.lens_index)
+      ) {
+        const lr = lensResults[exactMatch.lens_index];
+        usedLensIndexes.add(exactMatch.lens_index);
+
+        products.push({
+          title: lr.title || exactMatch.title || '',
+          price: lr.price || safeNumber(exactMatch.price, 0),
+          source: lr.source || exactMatch.source || '',
+          link: lr.link || exactMatch.link || '',
+          thumbnail: lr.thumbnail || exactMatch.thumbnail || '',
+          isExact: true
+        });
+      } else if (
+        exactMatch &&
+        exactMatch.link &&
+        typeof exactMatch.lens_index !== 'number'
+      ) {
+        // fallback if model returned a link but no valid index
+        products.push({
+          title: exactMatch.title || '',
+          price: safeNumber(exactMatch.price, 0),
+          source: exactMatch.source || '',
+          link: exactMatch.link || '',
+          thumbnail: exactMatch.thumbnail || '',
+          isExact: true
+        });
       }
 
-      // Then: AI-recommended similar items from approved retailers
-      for (const sim of (item.similar_items || []).slice(0, 5)) {
+      // similar items
+      for (const sim of (m.similar_items || []).slice(0, 5)) {
+        const title = sim?.title || '';
+        const source = sim?.source || '';
+        const query = title || m.item_name || '';
         products.push({
-          title: sim.title || '',
-          price: sim.estimated_price || 0,
-          source: sim.source || '',
-          link: sim.search_url || '',
+          title,
+          price: safeNumber(sim?.estimated_price, 0),
+          source,
+          link: sim?.search_url || buildRetailerSearchUrl(source, query),
           thumbnail: '',
           isExact: false,
-          why: sim.why || ''
+          why: sim?.why || ''
         });
       }
 
       return {
-        name: item.name,
-        order: item.order || 1,
-        styling_tip: item.styling_tip || '',
-        search_query: item.name,
-        exactCount: item.exact_match && item.exact_match.link ? 1 : 0,
+        name: m.item_name || `Item ${idx + 1}`,
+        item_type: m.item_type || 'other',
+        order: idx + 1,
+        match_type: m.match_type || (products.some((p) => p.isExact) ? 'exact' : 'none'),
+        confidence: typeof m.confidence === 'number' ? m.confidence : 0,
+        evidence: Array.isArray(m.evidence) ? m.evidence : [],
+        rejected_candidates: Array.isArray(m.rejected_candidates) ? m.rejected_candidates : [],
+        styling_tip: m.styling_tip || '',
+        search_query: m.item_name || '',
+        exactCount: products.some((p) => p.isExact) ? 1 : 0,
         products
       };
     });
 
     return res.status(200).json({
       items,
-      colors: identified.colors || [],
+      colors: Array.isArray(identified.colors) ? identified.colors : [],
       style_summary: identified.style_summary || '',
       lens_used: !!imageUrl,
       lens_total: lensResults.length,
       log: log.join(' | ')
     });
-
   } catch (err) {
-    return res.status(500).json({ error: err.message, log: log.join(' | ') });
+    return res.status(500).json({
+      error: err?.message || 'Unknown error',
+      log: log.join(' | ')
+    });
   }
 }
